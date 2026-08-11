@@ -153,16 +153,28 @@ where
                 continue;
             }
         };
+        let cleaned = super::clean::strip_boilerplate(&fetched.markdown);
+        let body_trim = cleaned.trim();
+        let summary = summarize(body_trim);
+        // Front-matter (and topic) description comes from source metadata, not
+        // the body — otherwise the fetched markdown's first junk lines leak into
+        // the meta description. Fall back to a cleaned-body summary only when the
+        // site exposes no meta description at all.
+        let description = if fetched.description.is_empty() {
+            summary.clone()
+        } else {
+            fetched.description.clone()
+        };
         let disk_path = root_dir.join(&rel);
-        let hash = content_hash(fetched.markdown.trim());
+        let hash = content_hash(body_trim);
         let fm = format!(
             "title = {t:?}\ndescription = {d:?}\n[extra]\nsource_url = {u:?}\ncontent_hash = {h:?}\n",
             t = fetched.title,
-            d = summarize(&fetched.markdown),
+            d = description,
             u = fetched.url,
             h = hash,
         );
-        if let Err(e) = write_page(&disk_path, &fm, &fetched.markdown) {
+        if let Err(e) = write_page(&disk_path, &fm, &cleaned) {
             failures += 1;
             log::error!("migrate: write {}: {e}", disk_path.display());
             continue;
@@ -171,15 +183,15 @@ where
             url: fetched.url.clone(),
             path: rel,
             title: fetched.title.clone(),
-            summary: summarize(&fetched.markdown),
+            summary,
             content_hash: hash,
             topic_ids: vec![],
         };
         store.pages.push(page);
         let input = TopicInput {
             title: fetched.title,
-            description: String::new(),
-            body: fetched.markdown,
+            description,
+            body: cleaned,
         };
         let page_url = fetched.url.clone();
         match super::topics::enrich_one(
@@ -275,8 +287,8 @@ mod tests {
         let fx = Fixture::new();
         let urls = vec!["https://x/a".into(), "https://x/b".into()];
         let fetcher = super::super::firecrawl::MockFetcher::new()
-            .with("https://x/a", "Page A", "Body of A.")
-            .with("https://x/b", "Page B", "Body of B.");
+            .with("https://x/a", "Page A", "Body of A.", "")
+            .with("https://x/b", "Page B", "Body of B.", "");
 
         // first migrate succeeds
         migrate_with(
@@ -340,7 +352,7 @@ mod tests {
     #[test]
     fn dry_run_writes_nothing() {
         let fx = Fixture::new();
-        let fetcher = super::super::firecrawl::MockFetcher::new().with("https://x/a", "A", "body");
+        let fetcher = super::super::firecrawl::MockFetcher::new().with("https://x/a", "A", "body", "");
         migrate_with(
             fx.root(),
             "https://x",
@@ -357,6 +369,44 @@ mod tests {
         assert!(!fx.root().join("data/graph/meta.json").exists());
     }
 
+    /// The front-matter `description` must come from source metadata, not the
+    /// body's first (polluted) lines, and the written body must be cleaned.
+    #[test]
+    fn migrate_description_uses_source_metadata_and_cleans_body() {
+        let fx = Fixture::new();
+        let body = "Hit enter to search or ESC to closeSearch\n\
+                    [Close Search](https://x/#)\n\
+                    [ATS Optimization](https://x/cat/ats) [Resume Tips](https://x/cat/tips)\n\
+                    # Real Title\n\nReal intro sentence about ATS.\n";
+        let fetcher = super::super::firecrawl::MockFetcher::new().with(
+            "https://x/a",
+            "Real Title",
+            body,
+            "How ATS really works in 2026.",
+        );
+        migrate_with(
+            fx.root(),
+            "https://x",
+            None,
+            false,
+            false,
+            &FixedSitemap(vec!["https://x/a".into()]),
+            Some(&fetcher),
+            &FixedTopics,
+            "k",
+        )
+        .unwrap();
+        let page = fs::read_to_string(fx.root().join("content/a/index.md")).unwrap();
+        assert!(
+            page.contains("description = \"How ATS really works in 2026.\""),
+            "meta description must be source metadata, not the body:\n{page}"
+        );
+        assert!(!page.contains("Hit enter to search"), "chrome leaked into page");
+        assert!(!page.contains("Close Search"), "chrome leaked into page");
+        assert!(page.contains("Real intro sentence about ATS."), "real body dropped");
+        assert!(page.contains("# Real Title"));
+    }
+
     /// Full loop: migrate once → refresh after a body edit → second migrate w/o
     /// force fails. Refresh must never touch Firecrawl (no fetcher passed).
     #[test]
@@ -364,7 +414,7 @@ mod tests {
         let fx = Fixture::new();
         let urls = vec!["https://x/a".into()];
         let fetcher =
-            super::super::firecrawl::MockFetcher::new().with("https://x/a", "A", "Original body.");
+            super::super::firecrawl::MockFetcher::new().with("https://x/a", "A", "Original body.", "");
 
         migrate_with(
             fx.root(),
