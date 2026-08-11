@@ -126,6 +126,26 @@ fn html_decode(s: &str) -> String {
         .replace("&quot;", "\"")
 }
 
+/// Static-asset extensions filtered out of the crawl scope before fetching.
+/// ponytail: flat extension list, no MIME lookup. Ceiling = an asset served
+/// with no extension (e.g. a CDN image URL like `/img/abc`) is not caught —
+/// acceptable, Firecrawl would still 4xx/5xx it and it'd count as a failure
+/// rather than silently ship. Add MIME sniffing only if a real site trips it.
+const ASSET_EXT: &[&str] = &[
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".css", ".js", ".json",
+    ".xml", ".pdf", ".zip", ".mp4", ".webm", ".woff", ".woff2", ".ttf",
+];
+
+/// True if `url` points at a static asset (image / font / doc / media / style /
+/// script / feed), not an HTML page. Case-insensitive; ignores the query string
+/// and fragment. `migrate` applies this **before** the `--max` cap so the cap
+/// yields N real pages, and skipped assets are not counted as failures.
+pub fn is_asset_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    ASSET_EXT.iter().any(|ext| lower.ends_with(ext))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +196,39 @@ mod tests {
         match parse_sitemap(xml) {
             Sitemap::UrlSet(v) => assert_eq!(v, vec!["https://x/c".to_string()]),
             other => panic!("expected UrlSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_asset_url_flags_common_assets_case_insensitive() {
+        for asset in [
+            "https://ats.curriculo.me/favicon.ico",
+            "https://x/a.png?ver=1",
+            "https://x/a.JPG",
+            "https://x/logo.webp#logo",
+            "https://x/feed.xml",
+            "https://x/site.css",
+            "https://x/app.js?v=2",
+            "https://x/data.json",
+            "https://x/font.woff2",
+            "https://x/clip.mp4",
+            "https://x/doc.pdf",
+        ] {
+            assert!(is_asset_url(asset), "expected asset: {asset}");
+        }
+    }
+
+    #[test]
+    fn is_asset_url_keeps_html_pages() {
+        for page in [
+            "https://x/blog/how-ats-works-2026/",
+            "https://x/page#section",
+            "https://x/index.html",
+            "https://x/ico",            // no dot, not an extension
+            "https://x/",               // homepage
+            "https://x/about?utm=1",
+        ] {
+            assert!(!is_asset_url(page), "expected page (not asset): {page}");
         }
     }
 }

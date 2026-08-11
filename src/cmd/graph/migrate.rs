@@ -109,11 +109,19 @@ where
         );
     }
 
-    let cap = max.unwrap_or(usize::MAX);
     let urls = sitemap_src.urls(from)?;
     let total = urls.len();
-    let planned: Vec<&String> = urls.iter().take(cap).collect();
-    log::info!("migrate: {from} → {total} sitemap URLs, {} in scope", planned.len());
+    // Filter non-HTML assets (favicon.ico, .png/.xml/.css/…) BEFORE the cap so
+    // the cap yields N real pages. Assets 4xx/5xx in Firecrawl and would trip
+    // the run's failure threshold; skipped assets are not counted as failures.
+    let pages: Vec<String> = urls.into_iter().filter(|u| !sitemap::is_asset_url(u)).collect();
+    let skipped_assets = total - pages.len();
+    let cap = max.unwrap_or(usize::MAX);
+    let planned: Vec<&String> = pages.iter().take(cap).collect();
+    log::info!(
+        "migrate: {from} → {total} sitemap URLs, {skipped_assets} asset(s) filtered, {} in scope",
+        planned.len()
+    );
 
     if dry_run {
         log::info!(
@@ -405,6 +413,39 @@ mod tests {
         assert!(!page.contains("Close Search"), "chrome leaked into page");
         assert!(page.contains("Real intro sentence about ATS."), "real body dropped");
         assert!(page.contains("# Real Title"));
+    }
+
+    /// Asset URLs are filtered out of crawl scope before the --max cap, so the
+    /// cap yields N real pages and an asset is never fetched (MockFetcher has no
+    /// entry for it, so a fetch would count as a failure and bail the run).
+    #[test]
+    fn migrate_skips_asset_urls_before_cap() {
+        let fx = Fixture::new();
+        // sitemap: 1 asset + 2 real pages; --max 2 must hit the 2 real pages,
+        // not [asset, page1].
+        let urls = vec![
+            "https://x/favicon.ico".into(),
+            "https://x/a".into(),
+            "https://x/b".into(),
+        ];
+        let fetcher = super::super::firecrawl::MockFetcher::new()
+            .with("https://x/a", "A", "# A\n\nBody A.\n", "")
+            .with("https://x/b", "B", "# B\n\nBody B.\n", "");
+        migrate_with(
+            fx.root(),
+            "https://x",
+            Some(2),
+            false,
+            false,
+            &FixedSitemap(urls),
+            Some(&fetcher),
+            &FixedTopics,
+            "k",
+        )
+        .unwrap(); // unwraps ⇒ no failure counted for the filtered asset
+        assert!(fx.root().join("content/a/index.md").exists());
+        assert!(fx.root().join("content/b/index.md").exists());
+        assert!(!fx.root().join("content/favicon.ico/index.md").exists());
     }
 
     /// Full loop: migrate once → refresh after a body edit → second migrate w/o
