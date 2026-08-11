@@ -13,6 +13,7 @@
 //!
 //! Network lives only in migrate/refresh — `zola build` stays offline.
 
+pub mod clean;
 pub mod firecrawl;
 pub mod html_to_md;
 pub mod migrate;
