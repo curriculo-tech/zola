@@ -111,10 +111,7 @@ fn fetch_text(url: &str, client: &Client) -> Result<String> {
 
 /// Build the shared blocking client (UA + sane timeout). Live callers use this.
 pub fn http_client() -> Result<Client> {
-    Ok(Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent("zola-graph/0.1")
-        .build()?)
+    Ok(Client::builder().timeout(Duration::from_secs(60)).user_agent("zola-graph/0.1").build()?)
 }
 
 /// Minimal entity decode for `<loc>` URL contents (`&amp;` `&lt;` `&gt;`).
@@ -175,10 +172,7 @@ mod tests {
 </urlset>"#;
         assert_eq!(
             parse_sitemap(xml),
-            Sitemap::UrlSet(vec![
-                "https://x/blog/a?x=1&y=2".into(),
-                "https://x/blog/b".into(),
-            ])
+            Sitemap::UrlSet(vec!["https://x/blog/a?x=1&y=2".into(), "https://x/blog/b".into(),])
         );
     }
 
@@ -224,8 +218,8 @@ mod tests {
             "https://x/blog/how-ats-works-2026/",
             "https://x/page#section",
             "https://x/index.html",
-            "https://x/ico",            // no dot, not an extension
-            "https://x/",               // homepage
+            "https://x/ico", // no dot, not an extension
+            "https://x/",    // homepage
             "https://x/about?utm=1",
         ] {
             assert!(!is_asset_url(page), "expected page (not asset): {page}");

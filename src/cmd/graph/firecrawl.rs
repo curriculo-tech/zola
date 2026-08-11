@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use errors::{Result, anyhow, bail};
 use reqwest::blocking::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::html_to_md;
 
@@ -67,14 +67,11 @@ impl PageFetcher for FirecrawlFetcher {
         if !status.is_success() {
             bail!("Firecrawl HTTP {status}: {}", take200(&text));
         }
-        let data: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("Firecrawl non-JSON response: {e}"))?;
+        let data: Value =
+            serde_json::from_str(&text).map_err(|e| anyhow!("Firecrawl non-JSON response: {e}"))?;
         let inner = &data["data"];
         let md = inner["markdown"].as_str().unwrap_or("").to_string();
-        let mut title = inner["metadata"]["title"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let mut title = inner["metadata"]["title"].as_str().unwrap_or("").to_string();
         let description = extract_description(&inner["metadata"]);
         // markdown fallback: some sites return html only — convert then.
         let (markdown, html) = if md.trim().is_empty() {
@@ -89,12 +86,7 @@ impl PageFetcher for FirecrawlFetcher {
         if markdown.trim().is_empty() {
             bail!("Firecrawl: empty body for {url}");
         }
-        Ok(FetchedPage {
-            url: url.to_string(),
-            title,
-            markdown,
-            description,
-        })
+        Ok(FetchedPage { url: url.to_string(), title, markdown, description })
     }
 }
 
@@ -172,10 +164,7 @@ impl Default for MockFetcher {
 #[cfg(test)]
 impl PageFetcher for MockFetcher {
     fn fetch(&self, url: &str) -> Result<FetchedPage> {
-        self.pages
-            .get(url)
-            .cloned()
-            .ok_or_else(|| anyhow!("MockFetcher: no page for {url}"))
+        self.pages.get(url).cloned().ok_or_else(|| anyhow!("MockFetcher: no page for {url}"))
     }
 }
 
@@ -189,12 +178,8 @@ mod tests {
 
     #[test]
     fn mock_fetcher_returns_registered_page() {
-        let f = MockFetcher::new().with(
-            "https://x/a",
-            "A",
-            "# A\n\nBody of a.\n",
-            "Meta description",
-        );
+        let f =
+            MockFetcher::new().with("https://x/a", "A", "# A\n\nBody of a.\n", "Meta description");
         let p = f.fetch("https://x/a").unwrap();
         assert_eq!(p.title, "A");
         assert_eq!(p.description, "Meta description");
@@ -228,14 +213,8 @@ mod tests {
             extract_description(&json!({"description": "Yoast summary", "og:description": "og"})),
             "Yoast summary"
         );
-        assert_eq!(
-            extract_description(&json!({"og:description": "og only"})),
-            "og only"
-        );
-        assert_eq!(
-            extract_description(&json!({"ogDescription": "camel"})),
-            "camel"
-        );
+        assert_eq!(extract_description(&json!({"og:description": "og only"})), "og only");
+        assert_eq!(extract_description(&json!({"ogDescription": "camel"})), "camel");
         assert_eq!(extract_description(&json!({})), "");
     }
 

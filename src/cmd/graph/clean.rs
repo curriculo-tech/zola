@@ -31,14 +31,10 @@ pub fn strip_boilerplate(md: &str) -> String {
     let lines: Vec<&str> = md.lines().collect();
 
     // Pass 1: avatar/author lines anywhere.
-    let no_avatar: Vec<&str> =
-        lines.iter().copied().filter(|l| !is_avatar_line(l)).collect();
+    let no_avatar: Vec<&str> = lines.iter().copied().filter(|l| !is_avatar_line(l)).collect();
 
     // Pass 2: leading chrome. `start` = index of first real line.
-    let start = no_avatar
-        .iter()
-        .position(|l| !is_leading_chrome(l))
-        .unwrap_or(no_avatar.len());
+    let start = no_avatar.iter().position(|l| !is_leading_chrome(l)).unwrap_or(no_avatar.len());
 
     // Pass 3: trailing footer marker, searched only in the kept region.
     let end = no_avatar[start..]
@@ -292,7 +288,8 @@ mod tests {
 
     #[test]
     fn truncates_at_next_post_marker() {
-        let md = "# Title\n\nBody.\n\n_Next Post_\n\n### You May Also Like\n\n[Related](https://x/r)\n";
+        let md =
+            "# Title\n\nBody.\n\n_Next Post_\n\n### You May Also Like\n\n[Related](https://x/r)\n";
         kept(md, &["Body."]);
         poison_free(md, &["_Next Post_", "You May Also Like", "Related"]);
     }
@@ -314,8 +311,10 @@ mod tests {
                   - [AI Resume BuilderBuild an ATS-ready resume that gets past the filters.](https://x/b)\n\
                   - [FeaturesKeyword matching, formatting checks.](https://x/c)\n";
         let out = strip_boilerplate(md);
-        assert!(out.contains("[Employers Share Their Most Outrageous Resume Mistakes]"),
-            "real reference list must survive:\n{out}");
+        assert!(
+            out.contains("[Employers Share Their Most Outrageous Resume Mistakes]"),
+            "real reference list must survive:\n{out}"
+        );
         poison_free(md, &["AI Resume BuilderBuild", "FeaturesKeyword"]);
     }
 
