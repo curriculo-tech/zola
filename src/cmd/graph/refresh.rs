@@ -7,12 +7,12 @@
 //! Public [`refresh`] reads `OPENROUTER_API_KEY`; [`refresh_with`] is the
 //! offline-testable core taking an injected [`TopicClient`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use errors::{Result, anyhow, bail};
+use errors::{anyhow, bail, Result};
 use regex::Regex;
 use toml::Value;
 
@@ -155,6 +155,7 @@ fn refresh_with_inner<C: TopicClient>(
         }
     }
 
+    mark_untranslated_siblings(&mut store, default_lang);
     prune_store(&mut store, &seen);
 
     if store.organizations.is_empty() {
@@ -281,8 +282,64 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
+/// Han / Hiragana / Katakana / Hangul — each such character counts as one
+/// “word” so CJK pages are not marked thin by `split_whitespace` alone.
+fn is_cjk_or_hangul(c: char) -> bool {
+    matches!(
+        c,
+        '\u{1100}'..='\u{11FF}' // Hangul Jamo
+            | '\u{3040}'..='\u{309F}' // Hiragana
+            | '\u{30A0}'..='\u{30FF}' // Katakana
+            | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
+            | '\u{31F0}'..='\u{31FF}' // Katakana Phonetic Extensions
+            | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Ext A
+            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+            | '\u{A960}'..='\u{A97F}' // Hangul Jamo Ext A
+            | '\u{AC00}'..='\u{D7FF}' // Hangul Syllables + Jamo Ext B
+            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+            | '\u{FF66}'..='\u{FF9D}' // Halfwidth Katakana
+    )
+}
+
 fn word_count_of(body: &str) -> u32 {
-    strip_html_tags(body).split_whitespace().count() as u32
+    let text = strip_html_tags(body);
+    let spaced = text.split_whitespace().count() as u32;
+    let cjk = text.chars().filter(|c| is_cjk_or_hangul(*c)).count() as u32;
+    spaced + cjk
+}
+
+/// Locale siblings that still share a body hash with the default-lang page
+/// (or with another locale of the same slug) stay out of the sitemap.
+/// Default-lang pages are never hidden here.
+fn mark_untranslated_siblings(store: &mut super::schema::GraphStore, default_lang: &str) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, page) in store.pages.iter().enumerate() {
+        let key = page.translation_of.clone().unwrap_or_else(|| page.id.clone());
+        groups.entry(key).or_default().push(i);
+    }
+    let mut hide = Vec::new();
+    for idxs in groups.values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        for &i in idxs {
+            if store.pages[i].lang == default_lang {
+                continue;
+            }
+            let hash = &store.pages[i].content_hash;
+            if hash.is_empty() {
+                continue;
+            }
+            let dup = idxs.iter().any(|&j| j != i && store.pages[j].content_hash == *hash);
+            if dup {
+                hide.push(i);
+            }
+        }
+    }
+    for i in hide {
+        store.pages[i].noindex = true;
+        store.pages[i].sitemap = false;
+    }
 }
 
 fn extract_h1(body: &str) -> String {
@@ -687,7 +744,11 @@ mod tests {
         }
         fn overview(&self, _title: &str, _body: &str, _key: &str) -> Result<String> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if n == 0 { Ok(words(10)) } else { Ok(words(140)) }
+            if n == 0 {
+                Ok(words(10))
+            } else {
+                Ok(words(140))
+            }
         }
     }
 
@@ -776,10 +837,7 @@ mod tests {
 
         refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
         let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
-        assert!(
-            after.pages.iter().all(|p| p.id != ghost),
-            "ghost page must be dropped"
-        );
+        assert!(after.pages.iter().all(|p| p.id != ghost), "ghost page must be dropped");
         assert!(
             !after.relations.iter().any(|r| r.from == ghost || r.to == ghost),
             "ghost page_topic edges must be dropped"
@@ -808,8 +866,14 @@ mod tests {
         let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
         let en = "content/_index.md";
         let fr = "content/_index.fr.md";
-        assert!(after.relations.iter().any(|r| r.kind == "translation" && r.from == fr && r.to == en));
-        assert!(after.relations.iter().any(|r| r.kind == "translation" && r.from == en && r.to == fr));
+        assert!(after
+            .relations
+            .iter()
+            .any(|r| r.kind == "translation" && r.from == fr && r.to == en));
+        assert!(after
+            .relations
+            .iter()
+            .any(|r| r.kind == "translation" && r.from == en && r.to == fr));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -872,6 +936,116 @@ mod tests {
         let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
         let home = after.pages.iter().find(|p| p.id == "content/_index.md").unwrap();
         assert!(home.overview.is_none(), "must not write a short stub overview");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn cjk_spaced(chars: usize, spaces: usize) -> String {
+        let n = spaces.max(1);
+        let chunk = (chars / n).max(1);
+        (0..n).map(|_| "語".repeat(chunk)).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn word_count_counts_cjk_chars_and_keeps_english_tokens() {
+        let cjk = cjk_spaced(3000, 100);
+        assert!(word_count_of(&cjk) >= 300, "got {}", word_count_of(&cjk));
+        assert_eq!(word_count_of(&words(50)), 50);
+        assert!(word_count_of(&"한".repeat(300)) >= 300);
+    }
+
+    #[test]
+    fn refresh_cjk_body_is_not_thin() {
+        let root = tmp_root();
+        seed_migrated(&root);
+        fs::create_dir_all(root.join("content/about-us")).unwrap();
+        fs::write(
+            root.join("content/about-us/index.md"),
+            format!("+++\ntitle = \"About\"\n+++\n\n{}\n", words(400)),
+        )
+        .unwrap();
+        fs::write(
+            root.join("content/about-us/index.ja.md"),
+            format!("+++\ntitle = \"私たちについて\"\n+++\n\n{}\n", cjk_spaced(3000, 100)),
+        )
+        .unwrap();
+        refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
+        let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
+        let ja = after.pages.iter().find(|p| p.id == "content/about-us/index.ja.md").unwrap();
+        assert!(ja.word_count >= 300, "got {}", ja.word_count);
+        assert!(!ja.thin);
+        let en = after.pages.iter().find(|p| p.id == "content/about-us/index.md").unwrap();
+        assert!(!en.thin);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_fifty_english_tokens_still_thin() {
+        let root = tmp_root();
+        seed_migrated(&root);
+        fs::create_dir_all(root.join("content/short")).unwrap();
+        fs::write(
+            root.join("content/short/index.md"),
+            format!("+++\ntitle = \"Short\"\n+++\n\n{}\n", words(50)),
+        )
+        .unwrap();
+        refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
+        let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
+        let short = after.pages.iter().find(|p| p.id == "content/short/index.md").unwrap();
+        assert_eq!(short.word_count, 50);
+        assert!(short.thin);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_hides_untranslated_locale_with_same_hash() {
+        let root = tmp_root();
+        seed_migrated(&root);
+        fs::create_dir_all(root.join("content/dup")).unwrap();
+        let body = words(400);
+        fs::write(
+            root.join("content/dup/index.md"),
+            format!("+++\ntitle = \"Dup\"\n+++\n\n{body}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("content/dup/index.ja.md"),
+            format!("+++\ntitle = \"Dup JA\"\n+++\n\n{body}\n"),
+        )
+        .unwrap();
+        refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
+        let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
+        let en = after.pages.iter().find(|p| p.id == "content/dup/index.md").unwrap();
+        let ja = after.pages.iter().find(|p| p.id == "content/dup/index.ja.md").unwrap();
+        assert!(en.sitemap);
+        assert!(!en.noindex);
+        assert!(!ja.sitemap);
+        assert!(ja.noindex);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_keeps_translated_cjk_in_sitemap() {
+        let root = tmp_root();
+        seed_migrated(&root);
+        fs::create_dir_all(root.join("content/ok")).unwrap();
+        fs::write(
+            root.join("content/ok/index.md"),
+            format!("+++\ntitle = \"Ok\"\n+++\n\n{}\n", words(400)),
+        )
+        .unwrap();
+        fs::write(
+            root.join("content/ok/index.ja.md"),
+            format!("+++\ntitle = \"了解\"\n+++\n\n{}\n", cjk_spaced(3000, 100)),
+        )
+        .unwrap();
+        refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
+        let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
+        let en = after.pages.iter().find(|p| p.id == "content/ok/index.md").unwrap();
+        let ja = after.pages.iter().find(|p| p.id == "content/ok/index.ja.md").unwrap();
+        assert!(en.sitemap);
+        assert!(ja.sitemap);
+        assert!(!ja.thin);
+        assert!(ja.word_count >= 300);
         fs::remove_dir_all(&root).unwrap();
     }
 }
