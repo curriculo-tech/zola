@@ -218,11 +218,13 @@ fn fill_page_fields(
     let title = fm.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let body_trim = body.trim();
     let wc = word_count_of(body);
-    let stub = title.is_empty() || title == "—" || body_trim.is_empty();
+    let stub = is_stub(&title, body_trim, file_name);
     let noindex = extra_bool(fm, "noindex").unwrap_or(false);
     let extra_sitemap_false = extra_bool(fm, "sitemap") == Some(false);
     let canonical_path = canonical_path_from_rel(rel, default_lang);
-    let thin = !stub && wc < 300 && !is_thin_exempt(&canonical_path);
+    // Section listings (/ and /blogs/) often have word_count=0 because copy
+    // lives in frontmatter. They are not thin content.
+    let thin = !stub && wc < 300 && !is_thin_exempt(&canonical_path) && !is_section_index(file_name);
     let sitemap = !(stub || noindex || extra_sitemap_false);
     let lang = lang_from_filename(file_name, default_lang);
     let translation_of =
@@ -260,6 +262,24 @@ fn default_lang_page_id(rel: &str, file_name: &str, lang: &str) -> String {
         None => default_name,
     };
     page_id_from_rel(&default_rel)
+}
+
+fn is_section_index(file_name: &str) -> bool {
+    file_name == "_index.md" || file_name.starts_with("_index.")
+}
+
+/// Stub = unfinished page. Empty-body **leaf** pages stay stubs. Empty-body
+/// **section** `_index` with a real title is a listing / frontmatter-driven
+/// page (homepage, /blogs/) — not a stub. Title `—` or empty is always a stub
+/// (locale homes).
+fn is_stub(title: &str, body_trim: &str, file_name: &str) -> bool {
+    if title.is_empty() || title == "—" {
+        return true;
+    }
+    if !body_trim.is_empty() {
+        return false;
+    }
+    !is_section_index(file_name)
 }
 
 fn is_thin_exempt(canonical_path: &str) -> bool {
@@ -720,6 +740,43 @@ mod tests {
         let empty = after.pages.iter().find(|p| p.id == "content/empty/index.md").unwrap();
         assert!(empty.stub);
         assert!(!empty.sitemap);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_section_index_empty_body_is_not_stub() {
+        let root = tmp_root();
+        seed_migrated(&root);
+        fs::create_dir_all(root.join("content")).unwrap();
+        fs::write(
+            root.join("content/_index.md"),
+            "+++\ntitle = \"AI ATS\"\ndescription = \"Homepage copy in frontmatter.\"\n+++\n\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("content/blogs")).unwrap();
+        fs::write(root.join("content/blogs/_index.md"), "+++\ntitle = \"Blog\"\n+++\n\n").unwrap();
+        fs::write(
+            root.join("content/_index.ja.md"),
+            "+++\ntitle = \"—\"\n[extra]\nnoindex = true\n+++\n\n",
+        )
+        .unwrap();
+        refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
+        let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
+
+        let home = after.pages.iter().find(|p| p.id == "content/_index.md").unwrap();
+        assert!(!home.stub, "frontmatter-driven homepage is not a stub");
+        assert!(!home.thin, "section index is not thin");
+        assert!(home.sitemap);
+
+        let blogs = after.pages.iter().find(|p| p.id == "content/blogs/_index.md").unwrap();
+        assert!(!blogs.stub, "listing _index is not a stub");
+        assert!(!blogs.thin);
+        assert!(blogs.sitemap);
+        assert_eq!(blogs.canonical_path, "/blogs/");
+
+        let ja = after.pages.iter().find(|p| p.id == "content/_index.ja.md").unwrap();
+        assert!(ja.stub, "em-dash locale home stays a stub");
+        assert!(!ja.sitemap);
         fs::remove_dir_all(&root).unwrap();
     }
 
