@@ -176,7 +176,9 @@ fn has_rel(store: &GraphStore, kind: &str, from: &str, to: &str) -> bool {
 fn check_duplicate_hash(store: &GraphStore, errors: &mut Vec<CheckError>) {
     let mut by_hash: HashMap<&str, Vec<&super::schema::Page>> = HashMap::new();
     for page in &store.pages {
-        if page.sitemap && !page.content_hash.is_empty() {
+        // Empty-body listings (section `_index` with copy in frontmatter) all
+        // hash to sha256("") — they are not content clones.
+        if page.sitemap && !page.content_hash.is_empty() && page.word_count > 0 {
             by_hash.entry(page.content_hash.as_str()).or_default().push(page);
         }
     }
@@ -689,6 +691,7 @@ mod tests {
             id: "content/a/index.md".into(),
             canonical_path: "/a/".into(),
             sitemap: true,
+            word_count: 40,
             content_hash: "abc".into(),
             ..Default::default()
         });
@@ -696,11 +699,35 @@ mod tests {
             id: "content/b/index.md".into(),
             canonical_path: "/b/".into(),
             sitemap: true,
+            word_count: 40,
             content_hash: "abc".into(),
             ..Default::default()
         });
         let report = check_store(&store, None, true);
         assert!(has_code(&report, "duplicate_hash"));
+    }
+
+    #[test]
+    fn duplicate_hash_ignores_empty_body_listings() {
+        let mut store = v2();
+        store.pages.push(Page {
+            id: "content/_index.md".into(),
+            canonical_path: "/".into(),
+            sitemap: true,
+            word_count: 0,
+            content_hash: "e3b0c442".into(),
+            ..Default::default()
+        });
+        store.pages.push(Page {
+            id: "content/blogs/_index.md".into(),
+            canonical_path: "/blogs/".into(),
+            sitemap: true,
+            word_count: 0,
+            content_hash: "e3b0c442".into(),
+            ..Default::default()
+        });
+        let report = check_store(&store, None, true);
+        assert!(!has_code(&report, "duplicate_hash"));
     }
 
     #[test]
@@ -710,6 +737,7 @@ mod tests {
             id: "content/a/index.md".into(),
             canonical_path: "/a/".into(),
             sitemap: true,
+            word_count: 40,
             content_hash: "abc".into(),
             ..Default::default()
         });
@@ -717,6 +745,7 @@ mod tests {
             id: "content/b/index.md".into(),
             canonical_path: "/b/".into(),
             sitemap: true,
+            word_count: 40,
             content_hash: "abc".into(),
             ..Default::default()
         });
