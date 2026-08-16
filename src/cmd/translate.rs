@@ -32,6 +32,9 @@ const MODEL: &str = "openai/gpt-4o-mini";
 /// INV-5: brand tokens that must survive translation verbatim when present in source.
 const GLOSSARY: &[&str] = &["Curriculo", "CurriculoATS"];
 const MAX_TOKENS: u32 = 16384;
+/// Bodies larger than this are translated in H2-sized chunks so each OpenRouter
+/// call stays under the JSON output cap (the old 113 KB pillar hit truncation).
+const BODY_CHUNK_CHARS: usize = 6_000;
 const FM_DELIM: &str = "+++";
 
 /// Target language code → human name for the system prompt.
@@ -66,55 +69,148 @@ pub struct OpenRouterClient;
 
 impl LlmClient for OpenRouterClient {
     fn translate(&self, fields: &Translatable, lang: &str, key: &str) -> Result<Translatable> {
-        let name =
-            lang_name(lang).ok_or_else(|| anyhow!("unsupported target language {lang:?}"))?;
-        let payload = json!({
-            "model": MODEL,
-            "response_format": {"type": "json_object"},
-            "max_tokens": MAX_TOKENS,
-            "messages": [
-                {"role": "system", "content": format!(
-                    "You translate marketing web content into {name}. Translate ONLY human-readable text. \
-                    Preserve these brand tokens verbatim, untranslated: {}. \
-                    Return a single JSON object with exactly these keys: title, description, body. No prose.",
-                    GLOSSARY.join(", ")
-                )},
-                {"role": "user", "content": json!({
-                    "title": fields.title, "description": fields.description, "body": fields.body
-                }).to_string()},
-            ],
-        });
-        let body = serde_json::to_vec(&payload)?;
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()?
-            .post(OPENROUTER_URL)
-            .bearer_auth(key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()?;
-        let status = resp.status();
-        let text = resp.text()?;
-        if !status.is_success() {
-            bail!("OpenRouter HTTP {status}: {}", take200(&text));
-        }
-        let data: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("OpenRouter non-JSON response: {e}"))?;
-        let content = data["choices"][0]["message"]["content"].as_str().ok_or_else(|| {
-            anyhow!("OpenRouter: unexpected shape: {}", take160(&data.to_string()))
-        })?;
-        let out: Value = serde_json::from_str(content).map_err(|_| {
-            anyhow!(
-                "model returned non-JSON (likely truncated at output cap): {}",
-                take160(content)
-            )
-        })?;
-        Ok(Translatable {
-            title: out["title"].as_str().unwrap_or("").to_string(),
-            description: out["description"].as_str().unwrap_or("").to_string(),
-            body: out["body"].as_str().unwrap_or("").to_string(),
-        })
+        translate_fields(self, fields, lang, key)
     }
+}
+
+/// One OpenRouter JSON-object call for a (possibly partial) page payload.
+fn translate_once<C: LlmClient>(
+    client: &C,
+    fields: &Translatable,
+    lang: &str,
+    key: &str,
+    body_only: bool,
+) -> Result<Translatable> {
+    let name = lang_name(lang).ok_or_else(|| anyhow!("unsupported target language {lang:?}"))?;
+    let system = if body_only {
+        format!(
+            "You translate marketing web page BODY markdown into {name}. Translate ONLY human-readable text. \
+            Preserve these brand tokens verbatim, untranslated: {}. \
+            Return a single JSON object with exactly these keys: title, description, body. \
+            Leave title and description as empty strings. No prose.",
+            GLOSSARY.join(", ")
+        )
+    } else {
+        format!(
+            "You translate marketing web content into {name}. Translate ONLY human-readable text. \
+            Preserve these brand tokens verbatim, untranslated: {}. \
+            Return a single JSON object with exactly these keys: title, description, body. No prose.",
+            GLOSSARY.join(", ")
+        )
+    };
+    let user_title = if body_only { "" } else { fields.title.as_str() };
+    let user_desc = if body_only { "" } else { fields.description.as_str() };
+    let payload = json!({
+        "model": MODEL,
+        "response_format": {"type": "json_object"},
+        "max_tokens": MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json!({
+                "title": user_title, "description": user_desc, "body": fields.body
+            }).to_string()},
+        ],
+    });
+    let body = serde_json::to_vec(&payload)?;
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?
+        .post(OPENROUTER_URL)
+        .bearer_auth(key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()?;
+    let status = resp.status();
+    let text = resp.text()?;
+    if !status.is_success() {
+        bail!("OpenRouter HTTP {status}: {}", take200(&text));
+    }
+    let data: Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow!("OpenRouter non-JSON response: {e}"))?;
+    let content = data["choices"][0]["message"]["content"].as_str().ok_or_else(|| {
+        anyhow!("OpenRouter: unexpected shape: {}", take160(&data.to_string()))
+    })?;
+    let out: Value = serde_json::from_str(content).map_err(|_| {
+        anyhow!(
+            "model returned non-JSON (likely truncated at output cap): {}",
+            take160(content)
+        )
+    })?;
+    Ok(Translatable {
+        title: out["title"].as_str().unwrap_or("").to_string(),
+        description: out["description"].as_str().unwrap_or("").to_string(),
+        body: out["body"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Split a long markdown body on H2 boundaries for chunked translation.
+fn chunk_body(body: &str) -> Vec<String> {
+    let body = body.trim();
+    if body.is_empty() || body.len() <= BODY_CHUNK_CHARS {
+        return vec![body.to_string()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, line) in body.lines().enumerate() {
+        let is_h2 = line.starts_with("## ");
+        if is_h2 && i > 0 && !current.is_empty() && current.len() >= BODY_CHUNK_CHARS / 2 {
+            chunks.push(current.trim_end().to_string());
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+        if current.len() >= BODY_CHUNK_CHARS {
+            chunks.push(current.trim_end().to_string());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current.trim_end().to_string());
+    }
+    if chunks.is_empty() {
+        vec![body.to_string()]
+    } else {
+        chunks
+    }
+}
+
+/// Translate title/description once; chunk the body when it exceeds [`BODY_CHUNK_CHARS`].
+fn translate_fields<C: LlmClient>(
+    client: &C,
+    fields: &Translatable,
+    lang: &str,
+    key: &str,
+) -> Result<Translatable> {
+    let chunks = chunk_body(&fields.body);
+    if chunks.len() == 1 {
+        return translate_once(client, fields, lang, key, false);
+    }
+    let head = Translatable {
+        title: fields.title.clone(),
+        description: fields.description.clone(),
+        body: chunks[0].clone(),
+    };
+    let first = translate_once(client, &head, lang, key, false)?;
+    let mut body_out = first.body;
+    for chunk in chunks.iter().skip(1) {
+        let partial = Translatable {
+            title: String::new(),
+            description: String::new(),
+            body: chunk.clone(),
+        };
+        let t = translate_once(client, &partial, lang, key, true)?;
+        if !body_out.is_empty() && !t.body.is_empty() {
+            body_out.push_str("\n\n");
+        }
+        body_out.push_str(&t.body);
+    }
+    Ok(Translatable {
+        title: first.title,
+        description: first.description,
+        body: body_out,
+    })
 }
 
 /// sha256 over the translatable fields, NUL-separated for an unambiguous boundary.
@@ -571,5 +667,56 @@ mod tests {
         let lost = Translatable { title: "Bienvenue sur Brand".into(), ..en.clone() };
         assert!(glossary_ok(&en, &ok).is_ok());
         assert!(glossary_ok(&en, &lost).is_err());
+    }
+
+    #[test]
+    fn chunk_body_splits_on_h2_when_large() {
+        let h2 = "## Section\n\n";
+        let para = "word ".repeat(800); // ~4k chars each
+        let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
+        let chunks = chunk_body(&body);
+        assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
+        let joined = chunks.join("\n\n");
+        assert!(joined.contains("## Section"));
+    }
+
+    /// Mock that counts calls — chunked bodies should invoke translate >1 time.
+    struct CountingClient {
+        calls: Cell<usize>,
+    }
+    impl LlmClient for CountingClient {
+        fn translate(&self, f: &Translatable, lang: &str, _key: &str) -> Result<Translatable> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Translatable {
+                title: if f.title.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{lang}] {}", f.title)
+                },
+                description: if f.description.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{lang}] {}", f.description)
+                },
+                body: format!("[{lang}] {}", f.body),
+            })
+        }
+    }
+
+    #[test]
+    fn large_body_uses_multiple_translate_calls() {
+        let h2 = "## Part\n\n";
+        let para = "Curriculo ".repeat(1200);
+        let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
+        let en = Translatable {
+            title: "Big Curriculo page".into(),
+            description: "desc".into(),
+            body,
+        };
+        let c = CountingClient { calls: Cell::new(0) };
+        let out = translate_fields(&c, &en, "es", "k").unwrap();
+        assert!(c.calls.get() > 1, "chunked body should call translate more than once");
+        assert!(out.body.contains("[es]"));
+        assert!(out.title.contains("Curriculo"));
     }
 }
