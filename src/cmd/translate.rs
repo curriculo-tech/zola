@@ -69,13 +69,12 @@ pub struct OpenRouterClient;
 
 impl LlmClient for OpenRouterClient {
     fn translate(&self, fields: &Translatable, lang: &str, key: &str) -> Result<Translatable> {
-        translate_fields(self, fields, lang, key)
+        translate_fields_openrouter(fields, lang, key)
     }
 }
 
 /// One OpenRouter JSON-object call for a (possibly partial) page payload.
-fn translate_once<C: LlmClient>(
-    client: &C,
+fn openrouter_translate_once(
     fields: &Translatable,
     lang: &str,
     key: &str,
@@ -176,6 +175,17 @@ fn chunk_body(body: &str) -> Vec<String> {
     }
 }
 
+fn translate_fields_openrouter(
+    fields: &Translatable,
+    lang: &str,
+    key: &str,
+) -> Result<Translatable> {
+    translate_fields_impl(
+        |f, body_only| openrouter_translate_once(f, lang, key, body_only),
+        fields,
+    )
+}
+
 /// Translate title/description once; chunk the body when it exceeds [`BODY_CHUNK_CHARS`].
 fn translate_fields<C: LlmClient>(
     client: &C,
@@ -183,16 +193,40 @@ fn translate_fields<C: LlmClient>(
     lang: &str,
     key: &str,
 ) -> Result<Translatable> {
+    translate_fields_impl(
+        |f, body_only| {
+            let payload = if body_only {
+                Translatable {
+                    title: String::new(),
+                    description: String::new(),
+                    body: f.body.clone(),
+                }
+            } else {
+                f.clone()
+            };
+            client.translate(&payload, lang, key)
+        },
+        fields,
+    )
+}
+
+fn translate_fields_impl<F>(
+    mut translate_one: F,
+    fields: &Translatable,
+) -> Result<Translatable>
+where
+    F: FnMut(&Translatable, bool) -> Result<Translatable>,
+{
     let chunks = chunk_body(&fields.body);
     if chunks.len() == 1 {
-        return translate_once(client, fields, lang, key, false);
+        return translate_one(fields, false);
     }
     let head = Translatable {
         title: fields.title.clone(),
         description: fields.description.clone(),
         body: chunks[0].clone(),
     };
-    let first = translate_once(client, &head, lang, key, false)?;
+    let first = translate_one(&head, false)?;
     let mut body_out = first.body;
     for chunk in chunks.iter().skip(1) {
         let partial = Translatable {
@@ -200,7 +234,7 @@ fn translate_fields<C: LlmClient>(
             description: String::new(),
             body: chunk.clone(),
         };
-        let t = translate_once(client, &partial, lang, key, true)?;
+        let t = translate_one(&partial, true)?;
         if !body_out.is_empty() && !t.body.is_empty() {
             body_out.push_str("\n\n");
         }
