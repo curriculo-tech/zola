@@ -13,9 +13,7 @@ use url::Url;
 
 use super::ids::is_hostful_url;
 use super::schema::GraphStore;
-
-const PILLAR_HOME: &str = "content/_index.md";
-const PILLAR_RESUME: &str = "content/ai-resume-builder/index.md";
+use super::site::GraphSiteConfig;
 
 static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<link\b[^>]*>").unwrap());
 static SITEMAP_LOC: LazyLock<Regex> =
@@ -38,13 +36,20 @@ pub struct CheckReport {
 pub fn check(root_dir: &Path, public_dir: Option<&Path>, json_only: bool) -> Result<CheckReport> {
     let store = GraphStore::load(&root_dir.join("data/graph"))?;
     let resolved = resolve_public(root_dir, public_dir, json_only);
-    Ok(check_at(&store, resolved.as_deref(), json_only, Some(root_dir)))
+    let site = GraphSiteConfig::load_optional(&root_dir.join("config.toml"));
+    Ok(check_at(
+        &store,
+        resolved.as_deref(),
+        json_only,
+        Some(root_dir),
+        &site,
+    ))
 }
 
 /// In-memory entry used by tests. `_redirects` is not consulted (no site root).
 #[cfg(test)]
 pub fn check_store(store: &GraphStore, public_dir: Option<&Path>, json_only: bool) -> CheckReport {
-    check_at(store, public_dir, json_only, None)
+    check_at(store, public_dir, json_only, None, &GraphSiteConfig::default())
 }
 
 /// CLI entry: print errors and fail the process when the report is non-empty.
@@ -83,6 +88,7 @@ fn check_at(
     public_dir: Option<&Path>,
     json_only: bool,
     root_dir: Option<&Path>,
+    site: &GraphSiteConfig,
 ) -> CheckReport {
     let mut errors = Vec::new();
     check_path_ids(store, &mut errors);
@@ -92,8 +98,8 @@ fn check_at(
     check_translation_json(store, &mut errors);
     check_missing_person(store, &mut errors);
     check_claim_collision(store, &mut errors);
-    check_pillar_split(store, &mut errors);
-    check_redirect_about(store, root_dir, &mut errors);
+    check_pillar_split(store, site, &mut errors);
+    check_redirect_about(store, root_dir, site, &mut errors);
     if !json_only {
         if let Some(public) = public_dir {
             check_hreflang(public, &mut errors);
@@ -272,19 +278,19 @@ fn check_claim_collision(store: &GraphStore, errors: &mut Vec<CheckError>) {
     }
 }
 
-fn check_pillar_split(store: &GraphStore, errors: &mut Vec<CheckError>) {
-    let split = store.relations.iter().any(|r| {
-        r.kind == "related"
-            && ((r.from == PILLAR_HOME && r.to == PILLAR_RESUME)
-                || (r.from == PILLAR_RESUME && r.to == PILLAR_HOME))
-    });
-    if split {
-        push(
-            errors,
-            "pillar_split",
-            Some(PILLAR_HOME.into()),
-            "related edge between homepage and /ai-resume-builder/ is forbidden",
-        );
+fn check_pillar_split(store: &GraphStore, site: &GraphSiteConfig, errors: &mut Vec<CheckError>) {
+    for (a, b) in &site.no_related {
+        let split = store.relations.iter().any(|r| {
+            r.kind == "related" && ((r.from == *a && r.to == *b) || (r.from == *b && r.to == *a))
+        });
+        if split {
+            push(
+                errors,
+                "pillar_split",
+                Some(a.clone()),
+                format!("related edge between {a} and {b} is forbidden"),
+            );
+        }
     }
 }
 
@@ -297,15 +303,15 @@ fn page_canonical(store: &GraphStore, id: &str) -> String {
         .unwrap_or_else(|| norm_path(id))
 }
 
-fn json_has_about_redirect(store: &GraphStore) -> bool {
+fn json_has_redirect(store: &GraphStore, src: &str, dst: &str) -> bool {
     store.relations.iter().any(|r| {
         r.kind == "redirect"
-            && page_canonical(store, &r.from) == "/about/"
-            && page_canonical(store, &r.to) == "/about-us/"
+            && page_canonical(store, &r.from) == src
+            && page_canonical(store, &r.to) == dst
     })
 }
 
-fn static_has_about_redirect(root: &Path) -> bool {
+fn static_has_redirect(root: &Path, src: &str, dst: &str) -> bool {
     let text = match fs::read_to_string(root.join("static/_redirects")) {
         Ok(t) => t,
         Err(_) => return false,
@@ -316,28 +322,34 @@ fn static_has_about_redirect(root: &Path) -> bool {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let Some(src) = parts.next() else { continue };
-        let Some(dst) = parts.next() else { continue };
-        if norm_path(src) == "/about/" && norm_path(dst) == "/about-us/" {
+        let Some(from) = parts.next() else { continue };
+        let Some(to) = parts.next() else { continue };
+        if norm_path(from) == src && norm_path(to) == dst {
             return true;
         }
     }
     false
 }
 
-fn check_redirect_about(store: &GraphStore, root_dir: Option<&Path>, errors: &mut Vec<CheckError>) {
-    if json_has_about_redirect(store) {
-        return;
+fn check_redirect_about(
+    store: &GraphStore,
+    root_dir: Option<&Path>,
+    site: &GraphSiteConfig,
+    errors: &mut Vec<CheckError>,
+) {
+    for (src, dst) in &site.required_redirects {
+        let ok_json = json_has_redirect(store, src, dst);
+        let ok_static = root_dir.is_some_and(|root| static_has_redirect(root, src, dst));
+        if ok_json || ok_static {
+            continue;
+        }
+        push(
+            errors,
+            "redirect_about",
+            None,
+            format!("missing redirect {src} → {dst} (JSON edge or static/_redirects)"),
+        );
     }
-    if root_dir.is_some_and(static_has_about_redirect) {
-        return;
-    }
-    push(
-        errors,
-        "redirect_about",
-        None,
-        "missing redirect /about/ → /about-us/ (JSON edge or static/_redirects)",
-    );
 }
 
 fn check_hreflang(public: &Path, errors: &mut Vec<CheckError>) {
@@ -820,22 +832,57 @@ mod tests {
     }
 
     #[test]
-    fn pillar_split_fails() {
+    fn pillar_split_fails_when_configured() {
         let mut store = v2();
         store.relations.push(Relation {
             from: "content/_index.md".into(),
-            to: "content/ai-resume-builder/index.md".into(),
+            to: "content/other/index.md".into(),
+            kind: "related".into(),
+        });
+        let root = tmp_dir();
+        store.save(&root.join("data/graph")).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\nno_related = [[\"content/_index.md\", \"content/other/index.md\"]]\n",
+        )
+        .unwrap();
+        let report = check(&root, None, true).unwrap();
+        assert!(has_code(&report, "pillar_split"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pillar_split_skipped_without_config() {
+        let mut store = v2();
+        store.relations.push(Relation {
+            from: "content/_index.md".into(),
+            to: "content/other/index.md".into(),
             kind: "related".into(),
         });
         let report = check_store(&store, None, true);
-        assert!(has_code(&report, "pillar_split"));
+        assert!(!has_code(&report, "pillar_split"));
     }
 
     #[test]
     fn redirect_about_fails_when_missing() {
         let store = v2();
-        let report = check_store(&store, None, true);
+        let root = tmp_dir();
+        store.save(&root.join("data/graph")).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\nrequired_redirects = [[\"/about/\", \"/about-us/\"]]\n",
+        )
+        .unwrap();
+        let report = check(&root, None, true).unwrap();
         assert!(has_code(&report, "redirect_about"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn redirect_about_skipped_without_config() {
+        let store = v2();
+        let report = check_store(&store, None, true);
+        assert!(!has_code(&report, "redirect_about"));
     }
 
     #[test]
@@ -846,8 +893,16 @@ mod tests {
             to: "/about-us/".into(),
             kind: "redirect".into(),
         });
-        let report = check_store(&store, None, true);
+        let root = tmp_dir();
+        store.save(&root.join("data/graph")).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\nrequired_redirects = [[\"/about/\", \"/about-us/\"]]\n",
+        )
+        .unwrap();
+        let report = check(&root, None, true).unwrap();
         assert!(!has_code(&report, "redirect_about"));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -857,6 +912,11 @@ mod tests {
         store.save(&root.join("data/graph")).unwrap();
         fs::create_dir_all(root.join("static")).unwrap();
         fs::write(root.join("static/_redirects"), "/about/    /about-us/     301\n").unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\nrequired_redirects = [[\"/about/\", \"/about-us/\"]]\n",
+        )
+        .unwrap();
         let report = check(&root, None, true).unwrap();
         assert!(!has_code(&report, "redirect_about"));
         fs::remove_dir_all(&root).unwrap();

@@ -76,12 +76,13 @@ data/graph/
 ## Operator / test loop
 
 ```bash
-zola graph migrate --from https://curriculo.me   # ONCE: Firecrawl + write content + data/graph
-zola build --base-url https://curriculo-me.pages.dev/
+zola graph migrate --from https://example.com   # ONCE: Firecrawl + write content + data/graph
+zola graph refresh
+zola build --base-url https://example.com/
 # enrich_jsonld + ./scripts/parity/parity gates  (#79 bar — landing-website)
 # …edit / add a blog in content/…
 zola graph refresh                               # local markdown only → update KG
-zola build --base-url https://curriculo-me.pages.dev/
+zola build --base-url https://example.com/
 # repeat last two forever
 ```
 

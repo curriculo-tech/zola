@@ -52,6 +52,19 @@ pub trait TopicClient {
         let _ = (title, body, key);
         bail!("overview not implemented")
     }
+
+    /// Overview prompt is site-generic (`title` / `description` / optional
+    /// `extra.graph.overview_instruction`). Default delegates to [`overview`].
+    fn overview_for_site(
+        &self,
+        title: &str,
+        body: &str,
+        key: &str,
+        site: &super::site::GraphSiteConfig,
+    ) -> Result<String> {
+        let _ = site;
+        self.overview(title, body, key)
+    }
 }
 
 /// Live OpenRouter client (blocking reqwest).
@@ -84,14 +97,26 @@ impl TopicClient for OpenRouterTopicClient {
         parse_extract(&content)
     }
 
-    fn overview(&self, title: &str, body: &str, key: &str) -> Result<String> {
+    fn overview_for_site(
+        &self,
+        title: &str,
+        body: &str,
+        key: &str,
+        site: &super::site::GraphSiteConfig,
+    ) -> Result<String> {
         let body = truncate(body, 4000);
+        let instruction = site.overview_instruction.as_deref().unwrap_or(
+            "Describe this page for an AI citation. Do not invent metrics.",
+        );
+        let site_title = if site.title.is_empty() { "this site" } else { site.title.as_str() };
         let user = format!(
             "Write 134 to 167 words, inclusive, plain prose, no heading, no bullets.\n\
-             Describe this Curriculo page for an AI citation. Product is one platform:\n\
-             ATS for recruiters and a free resume builder. Do not invent metrics.\n\
+             {instruction}\n\
+             Site: {site_title}\n\
+             {site_blurb}\n\
              Title: {title}\n\
-             Body: {body}"
+             Body: {body}",
+            site_blurb = site.description,
         );
         let payload = json!({
             "model": MODEL,
