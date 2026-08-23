@@ -156,7 +156,7 @@ pub enum GraphCommand {
     /// One-time Firecrawl crawl of a live site into markdown + topical KG.
     /// Refuses a second crawl for the same origin unless `--force`.
     Migrate {
-        /// Site origin to bootstrap from, e.g. `https://curriculo.me`.
+        /// Site origin to bootstrap from, e.g. `https://example.com`.
         #[clap(long)]
         from: String,
 

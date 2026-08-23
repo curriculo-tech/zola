@@ -18,10 +18,10 @@ use toml::Value;
 
 use super::ids::{canonical_path_from_rel, lang_from_filename, page_id_from_rel};
 use super::openrouter::{OpenRouterTopicClient, TopicClient, TopicInput};
-use super::schema::{Organization, Page};
+use super::schema::Page;
+use super::site::{seed_organization, GraphSiteConfig};
 use super::{content_hash, is_default_page, now_iso, parse_page, read_langs, summarize, walk_md};
 
-const PILLARS: &[&str] = &["content/_index.md", "content/ai-resume-builder/index.md"];
 const OVERVIEW_MIN: usize = 134;
 const OVERVIEW_MAX: usize = 167;
 
@@ -80,6 +80,7 @@ fn refresh_with_inner<C: TopicClient>(
     topic_client: &C,
     openrouter_key: &str,
 ) -> Result<()> {
+    let site = GraphSiteConfig::load_optional(&root_dir.join("config.toml"));
     let graph_dir = root_dir.join("data/graph");
     let content_dir = root_dir.join("content");
     let mut store = super::schema::GraphStore::load(&graph_dir)?;
@@ -141,11 +142,11 @@ fn refresh_with_inner<C: TopicClient>(
             todo.push((id.clone(), TopicInput { title, description, body: body_trim.to_string() }));
         }
 
-        if is_pillar(&id) && !dry_run && !stub {
+        if site.is_pillar(&id) && !dry_run && !stub {
             let missing = store.pages[idx].overview.as_ref().is_none_or(|s| s.is_empty());
             if missing || hash_stale {
                 let title = store.pages[idx].title.clone();
-                match fetch_overview(topic_client, &title, &body, openrouter_key) {
+                match fetch_overview(topic_client, &title, &body, openrouter_key, &site) {
                     Ok(text) => store.pages[idx].overview = Some(text),
                     Err(e) => {
                         log::warn!("refresh: overview {id}: {e}");
@@ -158,15 +159,7 @@ fn refresh_with_inner<C: TopicClient>(
     mark_untranslated_siblings(&mut store, default_lang);
     prune_store(&mut store, &seen);
 
-    if store.organizations.is_empty() {
-        store.organizations.push(Organization {
-            id: "org:curriculo".into(),
-            name: "Curriculo".into(),
-            url: String::new(), // hostless; templates prefix base_url
-            logo: "/v3-assets/curriculo-logo-144.webp".into(),
-            same_as: vec![],
-        });
-    }
+    seed_organization(&mut store, &site);
 
     log::info!("refresh: {} page(s) stale/new out of {} markdown files", todo.len(), files.len());
 
@@ -201,10 +194,6 @@ fn refresh_with_inner<C: TopicClient>(
         bail!("refresh completed with {failures} failure(s)");
     }
     Ok(())
-}
-
-fn is_pillar(id: &str) -> bool {
-    PILLARS.contains(&id)
 }
 
 fn fill_page_fields(
@@ -420,8 +409,9 @@ fn fetch_overview<C: TopicClient>(
     title: &str,
     body: &str,
     key: &str,
+    site: &GraphSiteConfig,
 ) -> Result<String> {
-    let text = client.overview(title, body, key)?;
+    let text = client.overview_for_site(title, body, key, site)?;
     if overview_in_range(&text) {
         return Ok(text);
     }
@@ -429,7 +419,7 @@ fn fetch_overview<C: TopicClient>(
         "refresh: overview word count {} outside {OVERVIEW_MIN}–{OVERVIEW_MAX}; retrying once",
         text.split_whitespace().count()
     );
-    let text = client.overview(title, body, key)?;
+    let text = client.overview_for_site(title, body, key, site)?;
     if overview_in_range(&text) {
         return Ok(text);
     }
@@ -508,6 +498,11 @@ mod tests {
         let r =
             std::env::temp_dir().join(format!("zola-graph-refresh-{id}-{}", std::process::id()));
         fs::create_dir_all(&r).unwrap();
+        fs::write(
+            r.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\npillars = [\"content/_index.md\"]\n",
+        )
+        .unwrap();
         r
     }
 
@@ -648,16 +643,22 @@ mod tests {
     }
 
     #[test]
-    fn refresh_seeds_org_curriculo_not_claims() {
+    fn refresh_seeds_org_from_extra_graph_not_claims() {
         let root = tmp_root();
         seed_migrated(&root);
+        fs::write(
+            root.join("config.toml"),
+            "title = \"Acme\"\n[extra.graph]\norg_id = \"org:acme\"\norg_name = \"Acme\"\norg_logo = \"/logo.webp\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("content/a")).unwrap();
         fs::write(root.join("content/a/index.md"), "+++\ntitle = \"A\"\n+++\n\nBody.\n").unwrap();
         refresh_with(&root, None, false, &FixedTopics, "k").unwrap();
         let after = super::super::schema::GraphStore::load(&root.join("data/graph")).unwrap();
         assert_eq!(after.organizations.len(), 1);
-        assert_eq!(after.organizations[0].id, "org:curriculo");
-        assert_eq!(after.organizations[0].name, "Curriculo");
+        assert_eq!(after.organizations[0].id, "org:acme");
+        assert_eq!(after.organizations[0].name, "Acme");
+        assert_eq!(after.organizations[0].logo, "/logo.webp");
         assert!(after.organizations[0].url.is_empty(), "org url is hostless");
         assert!(after.claims.is_empty(), "must not seed Claims");
         fs::remove_dir_all(&root).unwrap();

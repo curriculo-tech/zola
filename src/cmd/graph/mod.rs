@@ -25,6 +25,7 @@ pub mod migrate;
 pub mod openrouter;
 pub mod refresh;
 pub mod schema;
+pub mod site;
 pub mod sitemap;
 pub mod topics;
 

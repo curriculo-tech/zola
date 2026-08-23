@@ -31,7 +31,7 @@ Topical knowledge graph: pages ↔ topics ↔ relations, committed as JSON under
 
 ```bash
 # ONCE per origin (Firecrawl + OpenRouter) — writes content/** + data/graph/**
-zola --root <site> graph migrate --from https://curriculo.me [--max N] [--force] [--dry-run]
+zola --root <site> graph migrate --from https://example.com [--max N] [--force] [--dry-run]
 
 # Forever after (OpenRouter only) — updates data/graph from local markdown
 zola --root <site> graph refresh [--max N] [--dry-run]
@@ -39,20 +39,18 @@ zola --root <site> graph refresh [--max N] [--dry-run]
 
 **Hard rule:** Firecrawl is migrate-only. `refresh` and `build` never crawl.
 
-## Operator loop (curriculo.me → pages.dev)
+## Operator loop
+
+Identity (org, pillars, forbidden related-pairs) lives in the site's
+`config.toml` `[extra.graph]`, not in this binary.
 
 ```bash
-zola graph migrate --from https://curriculo.me   # once
-zola build --base-url https://curriculo-me.pages.dev/
-# enrich_jsonld + parity gates (#79 bar) in landing-website
-# …edit content/**…
-zola graph refresh                               # local KG only
-zola build --base-url https://curriculo-me.pages.dev/
-# repeat refresh + build forever
+zola graph migrate --from https://example.com   # once
+zola graph refresh
+zola build --base-url https://example.com/
 ```
 
-Deploy target today is **`curriculo-me.pages.dev`** (Cloudflare Pages). Live
-`curriculo.me` DNS cutover is a separate founder-gated step (Z-5).
+`zola build` stays offline. Firecrawl is migrate-only.
 
 ## Secrets
 

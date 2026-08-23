@@ -135,7 +135,7 @@ pub struct Person {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Organization {
-    pub id: String, // org:curriculo
+    pub id: String, // org:<slug>
     pub name: String,
     #[serde(default)]
     pub url: String,

@@ -16,6 +16,7 @@ use super::firecrawl::{FirecrawlFetcher, PageFetcher};
 use super::ids::{canonical_path_from_rel, page_id_from_rel};
 use super::openrouter::{OpenRouterTopicClient, TopicClient, TopicInput};
 use super::schema::{GraphStore, Meta, Page};
+use super::site::{seed_organization, GraphSiteConfig};
 use super::sitemap;
 use super::{content_hash, now_iso, read_langs, summarize, url_to_content_path, write_page};
 
@@ -214,6 +215,8 @@ where
         }
     }
 
+    let site = GraphSiteConfig::load_optional(&root_dir.join("config.toml"));
+    seed_organization(&mut store, &site);
     store.save(&graph_dir)?;
     log::info!(
         "migrate: wrote {} pages, enriched {enriched}, {failures} failure(s)",
