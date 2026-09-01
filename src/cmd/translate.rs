@@ -73,6 +73,135 @@ impl LlmClient for OpenRouterClient {
     }
 }
 
+/// Which of the three fields were actually sent, in request order. Empty fields
+/// are not sent at all: a body-only chunk would otherwise spend an engine call
+/// translating two empty strings.
+type SentFields = Vec<&'static str>;
+
+/// Client for a self-hosted translation endpoint.
+///
+/// Selected by setting `TRANSLATE_URL`; when it is unset the OpenRouter client
+/// above is used and behaviour is unchanged. Deliberately knows nothing about
+/// any particular engine or deployment — it speaks one small JSON contract:
+///
+/// ```text
+/// POST $TRANSLATE_URL
+///   {"texts": ["..."], "target_language": "ko", "source_language": "en"}
+/// → {"translations": ["..."]}
+/// ```
+///
+/// Translations come back in request order, one per input. Terminology that must
+/// survive verbatim is the endpoint's concern, not this client's — whatever it
+/// returns is still gated by [`glossary_ok`] before any file is written, so a
+/// mangled brand token fails the page rather than shipping it.
+pub struct TranslateApiClient {
+    url: String,
+    timeout: Duration,
+}
+
+impl TranslateApiClient {
+    pub fn new(url: impl Into<String>) -> Self {
+        // Generous by default: a self-hosted CPU model is far slower than a
+        // hosted LLM, and a page body is the whole request.
+        Self { url: url.into(), timeout: Duration::from_secs(300) }
+    }
+}
+
+impl LlmClient for TranslateApiClient {
+    fn translate(&self, fields: &Translatable, lang: &str, _key: &str) -> Result<Translatable> {
+        // Chunking lives inside the client, as it does for OpenRouter: the
+        // caller hands the whole body over in one piece, so without this a
+        // pillar page is a single enormous request. `body_only` is already
+        // implied here — build_translate_request skips empty fields.
+        translate_fields_impl(|f, _body_only| self.translate_once(f, lang), fields)
+    }
+}
+
+impl TranslateApiClient {
+    fn translate_once(&self, fields: &Translatable, lang: &str) -> Result<Translatable> {
+        let (payload, sent) = build_translate_request(fields, lang);
+        if sent.is_empty() {
+            return Ok(fields.clone());
+        }
+        let resp = reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .build()?
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&payload)?)
+            .send()?;
+        let status = resp.status();
+        let text = resp.text()?;
+        if !status.is_success() {
+            bail!("translate endpoint HTTP {status}: {}", take200(&text));
+        }
+        parse_translate_response(&text, &sent, fields)
+    }
+}
+
+/// Build the request body, and record which fields it carries so the response
+/// can be mapped back positionally.
+fn build_translate_request(fields: &Translatable, lang: &str) -> (Value, SentFields) {
+    let mut texts: Vec<&str> = Vec::new();
+    let mut sent: SentFields = Vec::new();
+    for (name, value) in [
+        ("title", &fields.title),
+        ("description", &fields.description),
+        ("body", &fields.body),
+    ] {
+        if !value.is_empty() {
+            texts.push(value.as_str());
+            sent.push(name);
+        }
+    }
+    let payload = json!({
+        "texts": texts,
+        "target_language": lang,
+        "source_language": "en",
+    });
+    (payload, sent)
+}
+
+/// Map `translations` back onto the fields that were sent. A field that was not
+/// sent keeps its original (empty) value.
+fn parse_translate_response(
+    text: &str,
+    sent: &SentFields,
+    fields: &Translatable,
+) -> Result<Translatable> {
+    let data: Value = serde_json::from_str(text)
+        .map_err(|e| anyhow!("translate endpoint non-JSON response: {e}"))?;
+    let arr = data["translations"].as_array().ok_or_else(|| {
+        anyhow!("translate endpoint: no `translations` array: {}", take160(&data.to_string()))
+    })?;
+    // A short array would silently shift every field onto the wrong key, so the
+    // length is a hard error rather than something to paper over.
+    if arr.len() != sent.len() {
+        bail!(
+            "translate endpoint returned {} translation(s) for {} text(s)",
+            arr.len(),
+            sent.len()
+        );
+    }
+    let mut out = Translatable {
+        title: String::new(),
+        description: String::new(),
+        body: String::new(),
+    };
+    for (name, value) in sent.iter().zip(arr) {
+        let s = value.as_str().unwrap_or("").to_string();
+        match *name {
+            "title" => out.title = s,
+            "description" => out.description = s,
+            _ => out.body = s,
+        }
+    }
+    // Fields we never sent were empty on the way in; keep them empty on the way
+    // out rather than inventing content.
+    let _ = fields;
+    Ok(out)
+}
+
 /// One OpenRouter JSON-object call for a (possibly partial) page payload.
 fn openrouter_translate_once(
     fields: &Translatable,
@@ -273,12 +402,21 @@ pub fn glossary_ok(en: &Translatable, t: &Translatable) -> Result<()> {
 
 /// Entry point from `main.rs`. Reads `OPENROUTER_API_KEY` (fail-fast when absent
 /// and not a dry-run), then delegates to [`translate_with`].
+///
+/// Opt-in alternative: when `TRANSLATE_URL` is set the call is served by
+/// [`TranslateApiClient`] instead and no API key is read. Unset — which is the
+/// default for every existing site — and nothing below this block changes.
 pub fn translate(
     root_dir: &Path,
     config_file: &Path,
     max: Option<usize>,
     dry_run: bool,
 ) -> Result<()> {
+    if let Some(url) = env::var("TRANSLATE_URL").ok().filter(|s| !s.is_empty()) {
+        log::info!("translate: using translation endpoint at {url}");
+        let client = TranslateApiClient::new(url);
+        return translate_with(root_dir, config_file, max, dry_run, "", &client);
+    }
     let key = if dry_run {
         String::new()
     } else {
@@ -566,6 +704,92 @@ mod tests {
     }
 
     /// Mock that prepends "[lang]" and counts calls via interior mutability.
+    // ── TranslateApiClient wire format ────────────────────────────────
+
+    fn t(title: &str, description: &str, body: &str) -> Translatable {
+        Translatable {
+            title: title.into(),
+            description: description.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn request_carries_every_non_empty_field_in_order() {
+        let (payload, sent) = build_translate_request(&t("T", "D", "B"), "ko");
+        assert_eq!(sent, vec!["title", "description", "body"]);
+        assert_eq!(payload["texts"], json!(["T", "D", "B"]));
+        assert_eq!(payload["target_language"], "ko");
+        assert_eq!(payload["source_language"], "en");
+    }
+
+    #[test]
+    fn body_only_chunk_sends_only_the_body() {
+        // translate_fields blanks title/description for continuation chunks;
+        // sending those empty strings would spend an engine call on nothing.
+        let (payload, sent) = build_translate_request(&t("", "", "B"), "ja");
+        assert_eq!(sent, vec!["body"]);
+        assert_eq!(payload["texts"], json!(["B"]));
+    }
+
+    #[test]
+    fn response_maps_back_onto_the_fields_that_were_sent() {
+        let (_, sent) = build_translate_request(&t("", "", "B"), "ja");
+        let out = parse_translate_response(
+            r#"{"translations":["本文"]}"#,
+            &sent,
+            &t("", "", "B"),
+        )
+        .unwrap();
+        assert_eq!(out.body, "本文");
+        assert!(out.title.is_empty() && out.description.is_empty());
+    }
+
+    #[test]
+    fn short_response_is_an_error_not_a_silent_shift() {
+        // Two translations for three texts would otherwise land the body on the
+        // description key and write a plausible-looking, wrong page.
+        let (_, sent) = build_translate_request(&t("T", "D", "B"), "fr");
+        let err = parse_translate_response(
+            r#"{"translations":["Titre","Description"]}"#,
+            &sent,
+            &t("T", "D", "B"),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("2 translation(s) for 3"));
+    }
+
+    #[test]
+    fn long_body_is_chunked_by_the_endpoint_client_too() {
+        // Regression: chunking lives inside each client impl, so a client that
+        // skips it sends a whole pillar page as one request. Counts the calls
+        // translate_fields_impl makes for an over-cap body.
+        let body = (0..40)
+            .map(|i| format!("## Heading {i}\n\n{}", "word ".repeat(120)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(body.len() > BODY_CHUNK_CHARS, "fixture must exceed the cap");
+        let mut calls = 0usize;
+        let out = translate_fields_impl(
+            |f, _body_only| {
+                calls += 1;
+                Ok(f.clone())
+            },
+            &t("T", "D", &body),
+        )
+        .unwrap();
+        assert!(calls > 1, "expected the body to be chunked, got {calls} call(s)");
+        assert_eq!(out.title, "T");
+    }
+
+    #[test]
+    fn missing_translations_array_is_an_error() {
+        let (_, sent) = build_translate_request(&t("T", "", ""), "fr");
+        let err = parse_translate_response(r#"{"oops":true}"#, &sent, &t("T", "", ""))
+            .unwrap_err();
+        assert!(format!("{err}").contains("translations"));
+    }
+
     struct EchoClient {
         calls: Cell<usize>,
     }
