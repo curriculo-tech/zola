@@ -64,12 +64,26 @@ pub trait LlmClient {
     fn translate(&self, fields: &Translatable, lang: &str, key: &str) -> Result<Translatable>;
 }
 
-/// Live OpenRouter client (blocking reqwest).
-pub struct OpenRouterClient;
+/// Live OpenRouter client (blocking reqwest). Pool built once per run.
+pub struct OpenRouterClient {
+    client: reqwest::blocking::Client,
+}
+
+impl OpenRouterClient {
+    pub fn new() -> Result<Self> {
+        Ok(Self { client: http_client(Duration::from_secs(120))? })
+    }
+}
+
+impl Default for OpenRouterClient {
+    fn default() -> Self {
+        Self::new().expect("reqwest client with default TLS")
+    }
+}
 
 impl LlmClient for OpenRouterClient {
     fn translate(&self, fields: &Translatable, lang: &str, key: &str) -> Result<Translatable> {
-        translate_fields_openrouter(fields, lang, key)
+        translate_fields_openrouter(&self.client, fields, lang, key)
     }
 }
 
@@ -94,17 +108,57 @@ type SentFields = Vec<&'static str>;
 /// survive verbatim is the endpoint's concern, not this client's — whatever it
 /// returns is still gated by [`glossary_ok`] before any file is written, so a
 /// mangled brand token fails the page rather than shipping it.
+///
+/// Failure envelopes are hard failures, never passthroughs: the endpoint may
+/// answer HTTP 200 with `"ok": false` (or a per-string `"ok"` array with any
+/// false) or a mirrored error code (e.g. `"code": 1003`), with `translations`
+/// carrying the ORIGINAL source text. Writing that would stamp English content
+/// as a fresh translation, so any of those shapes is an error and the sibling
+/// file is not written.
 pub struct TranslateApiClient {
     url: String,
-    timeout: Duration,
+    /// Built once per run and reused across chunks/requests: a blocking client
+    /// owns a connection pool, so rebuilding it per chunk throws the pool (and
+    /// keep-alive) away on every page.
+    client: reqwest::blocking::Client,
 }
 
 impl TranslateApiClient {
-    pub fn new(url: impl Into<String>) -> Self {
-        // Generous by default: a self-hosted CPU model is far slower than a
-        // hosted LLM, and a page body is the whole request.
-        Self { url: url.into(), timeout: Duration::from_secs(300) }
+    pub fn new(url: impl Into<String>, timeout: Duration) -> Result<Self> {
+        Ok(Self { url: url.into(), client: http_client(timeout)? })
     }
+}
+
+/// Shared client constructor. A generous timeout by default: a self-hosted CPU
+/// model is far slower than a hosted LLM, and a page body is the whole request.
+/// Override with `TRANSLATE_TIMEOUT` (seconds, floor 30 — see [`timeout_from_env`]).
+fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder().timeout(timeout).build()?)
+}
+
+/// `TRANSLATE_TIMEOUT` in seconds: default 300, clamped to a ≥30s floor (a
+/// typo like `3` would otherwise time out every real request). Non-numeric
+/// values are a config error and fail loudly rather than silently defaulting.
+fn timeout_from_env() -> Result<Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    const MIN_SECS: u64 = 30;
+    let Ok(raw) = env::var("TRANSLATE_TIMEOUT") else {
+        return Ok(Duration::from_secs(DEFAULT_SECS));
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Duration::from_secs(DEFAULT_SECS));
+    }
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| anyhow!("TRANSLATE_TIMEOUT must be a number of seconds, got {raw:?}"))?;
+    if secs < MIN_SECS {
+        log::warn!(
+            "translate: TRANSLATE_TIMEOUT={secs}s below the {MIN_SECS}s floor; using {MIN_SECS}s"
+        );
+        return Ok(Duration::from_secs(MIN_SECS));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 impl LlmClient for TranslateApiClient {
@@ -123,9 +177,8 @@ impl TranslateApiClient {
         if sent.is_empty() {
             return Ok(fields.clone());
         }
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(self.timeout)
-            .build()?
+        let resp = self
+            .client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(&payload)?)
@@ -144,11 +197,9 @@ impl TranslateApiClient {
 fn build_translate_request(fields: &Translatable, lang: &str) -> (Value, SentFields) {
     let mut texts: Vec<&str> = Vec::new();
     let mut sent: SentFields = Vec::new();
-    for (name, value) in [
-        ("title", &fields.title),
-        ("description", &fields.description),
-        ("body", &fields.body),
-    ] {
+    for (name, value) in
+        [("title", &fields.title), ("description", &fields.description), ("body", &fields.body)]
+    {
         if !value.is_empty() {
             texts.push(value.as_str());
             sent.push(name);
@@ -171,6 +222,42 @@ fn parse_translate_response(
 ) -> Result<Translatable> {
     let data: Value = serde_json::from_str(text)
         .map_err(|e| anyhow!("translate endpoint non-JSON response: {e}"))?;
+    // #1003-style failure envelopes arrive as HTTP 200 with the ORIGINAL source
+    // text in `translations`. Any of them means "not translated" — writing the
+    // file anyway would mark English content as a fresh translation, so they are
+    // hard errors. `ok` may be a bool, a per-string bool array (false = that
+    // string came back as source), or null/absent on older deployments.
+    if let Some(ok) = data.get("ok") {
+        match ok {
+            Value::Bool(false) => {
+                bail!(
+                    "translate endpoint reported ok:false — source text returned untranslated, not writing"
+                )
+            }
+            Value::Array(flags) => {
+                if let Some(i) = flags.iter().position(|f| !f.is_boolean() || !f.as_bool().unwrap())
+                {
+                    let field = sent.get(i).copied().unwrap_or("?");
+                    bail!(
+                        "translate endpoint: ok[{i}]=false — `{field}` came back untranslated, not writing"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    // Some gateways mirror the error status in the body of a 200 response
+    // (e.g. {"code": 1003}). 0 and 200 mean success; anything else does not.
+    for key in ["code", "status", "error_code"] {
+        let code = data
+            .get(key)
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+        if let Some(code) = code {
+            if code != 0 && code != 200 {
+                bail!("translate endpoint error code {code} in `{key}` — not writing");
+            }
+        }
+    }
     let arr = data["translations"].as_array().ok_or_else(|| {
         anyhow!("translate endpoint: no `translations` array: {}", take160(&data.to_string()))
     })?;
@@ -183,13 +270,16 @@ fn parse_translate_response(
             sent.len()
         );
     }
-    let mut out = Translatable {
-        title: String::new(),
-        description: String::new(),
-        body: String::new(),
-    };
+    let mut out =
+        Translatable { title: String::new(), description: String::new(), body: String::new() };
     for (name, value) in sent.iter().zip(arr) {
-        let s = value.as_str().unwrap_or("").to_string();
+        // A non-string entry (null/list/object) used to coerce to "" and write
+        // a blank title/description/body. Skip-with-warning is not an option
+        // here: there is nothing sane to write for the field, so the request
+        // fails and the existing sibling (if any) is left untouched.
+        let s = value.as_str().ok_or_else(|| {
+            anyhow!("translate endpoint: value for `{name}` is not a string ({}) — not writing blanks", json_kind(value))
+        })?.to_string();
         match *name {
             "title" => out.title = s,
             "description" => out.description = s,
@@ -202,8 +292,20 @@ fn parse_translate_response(
     Ok(out)
 }
 
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// One OpenRouter JSON-object call for a (possibly partial) page payload.
 fn openrouter_translate_once(
+    client: &reqwest::blocking::Client,
     fields: &Translatable,
     lang: &str,
     key: &str,
@@ -240,9 +342,7 @@ fn openrouter_translate_once(
         ],
     });
     let body = serde_json::to_vec(&payload)?;
-    let resp = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?
+    let resp = client
         .post(OPENROUTER_URL)
         .bearer_auth(key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -253,16 +353,13 @@ fn openrouter_translate_once(
     if !status.is_success() {
         bail!("OpenRouter HTTP {status}: {}", take200(&text));
     }
-    let data: Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow!("OpenRouter non-JSON response: {e}"))?;
-    let content = data["choices"][0]["message"]["content"].as_str().ok_or_else(|| {
-        anyhow!("OpenRouter: unexpected shape: {}", take160(&data.to_string()))
-    })?;
+    let data: Value =
+        serde_json::from_str(&text).map_err(|e| anyhow!("OpenRouter non-JSON response: {e}"))?;
+    let content = data["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("OpenRouter: unexpected shape: {}", take160(&data.to_string())))?;
     let out: Value = serde_json::from_str(content).map_err(|_| {
-        anyhow!(
-            "model returned non-JSON (likely truncated at output cap): {}",
-            take160(content)
-        )
+        anyhow!("model returned non-JSON (likely truncated at output cap): {}", take160(content))
     })?;
     Ok(Translatable {
         title: out["title"].as_str().unwrap_or("").to_string(),
@@ -297,20 +394,17 @@ fn chunk_body(body: &str) -> Vec<String> {
     if !current.is_empty() {
         chunks.push(current.trim_end().to_string());
     }
-    if chunks.is_empty() {
-        vec![body.to_string()]
-    } else {
-        chunks
-    }
+    if chunks.is_empty() { vec![body.to_string()] } else { chunks }
 }
 
 fn translate_fields_openrouter(
+    client: &reqwest::blocking::Client,
     fields: &Translatable,
     lang: &str,
     key: &str,
 ) -> Result<Translatable> {
     translate_fields_impl(
-        |f, body_only| openrouter_translate_once(f, lang, key, body_only),
+        |f, body_only| openrouter_translate_once(client, f, lang, key, body_only),
         fields,
     )
 }
@@ -339,10 +433,7 @@ fn translate_fields<C: LlmClient>(
     )
 }
 
-fn translate_fields_impl<F>(
-    mut translate_one: F,
-    fields: &Translatable,
-) -> Result<Translatable>
+fn translate_fields_impl<F>(mut translate_one: F, fields: &Translatable) -> Result<Translatable>
 where
     F: FnMut(&Translatable, bool) -> Result<Translatable>,
 {
@@ -358,22 +449,15 @@ where
     let first = translate_one(&head, false)?;
     let mut body_out = first.body;
     for chunk in chunks.iter().skip(1) {
-        let partial = Translatable {
-            title: String::new(),
-            description: String::new(),
-            body: chunk.clone(),
-        };
+        let partial =
+            Translatable { title: String::new(), description: String::new(), body: chunk.clone() };
         let t = translate_one(&partial, true)?;
         if !body_out.is_empty() && !t.body.is_empty() {
             body_out.push_str("\n\n");
         }
         body_out.push_str(&t.body);
     }
-    Ok(Translatable {
-        title: first.title,
-        description: first.description,
-        body: body_out,
-    })
+    Ok(Translatable { title: first.title, description: first.description, body: body_out })
 }
 
 /// sha256 over the translatable fields, NUL-separated for an unambiguous boundary.
@@ -413,8 +497,9 @@ pub fn translate(
     dry_run: bool,
 ) -> Result<()> {
     if let Some(url) = env::var("TRANSLATE_URL").ok().filter(|s| !s.is_empty()) {
-        log::info!("translate: using translation endpoint at {url}");
-        let client = TranslateApiClient::new(url);
+        let timeout = timeout_from_env()?;
+        log::info!("translate: using translation endpoint at {url} (timeout {timeout:?})");
+        let client = TranslateApiClient::new(url, timeout)?;
         return translate_with(root_dir, config_file, max, dry_run, "", &client);
     }
     let key = if dry_run {
@@ -425,7 +510,7 @@ pub fn translate(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("OPENROUTER_API_KEY not set — translate needs it"))?
     };
-    translate_with(root_dir, config_file, max, dry_run, &key, &OpenRouterClient)
+    translate_with(root_dir, config_file, max, dry_run, &key, &OpenRouterClient::new()?)
 }
 
 /// Testable core; takes the key and LLM client as parameters so tests inject a
@@ -653,6 +738,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -707,11 +793,7 @@ mod tests {
     // ── TranslateApiClient wire format ────────────────────────────────
 
     fn t(title: &str, description: &str, body: &str) -> Translatable {
-        Translatable {
-            title: title.into(),
-            description: description.into(),
-            body: body.into(),
-        }
+        Translatable { title: title.into(), description: description.into(), body: body.into() }
     }
 
     #[test]
@@ -735,12 +817,8 @@ mod tests {
     #[test]
     fn response_maps_back_onto_the_fields_that_were_sent() {
         let (_, sent) = build_translate_request(&t("", "", "B"), "ja");
-        let out = parse_translate_response(
-            r#"{"translations":["本文"]}"#,
-            &sent,
-            &t("", "", "B"),
-        )
-        .unwrap();
+        let out = parse_translate_response(r#"{"translations":["本文"]}"#, &sent, &t("", "", "B"))
+            .unwrap();
         assert_eq!(out.body, "本文");
         assert!(out.title.is_empty() && out.description.is_empty());
     }
@@ -785,9 +863,226 @@ mod tests {
     #[test]
     fn missing_translations_array_is_an_error() {
         let (_, sent) = build_translate_request(&t("T", "", ""), "fr");
-        let err = parse_translate_response(r#"{"oops":true}"#, &sent, &t("T", "", ""))
-            .unwrap_err();
+        let err = parse_translate_response(r#"{"oops":true}"#, &sent, &t("T", "", "")).unwrap_err();
         assert!(format!("{err}").contains("translations"));
+    }
+
+    #[test]
+    fn ok_false_is_a_hard_failure_not_source_passthrough() {
+        // #1003: HTTP 200 + ok:false means `translations` carries the ORIGINAL
+        // source text. Accepting it would write English into `<slug>.ko.md`
+        // stamped fresh (source_hash set) — exactly the bug this guards.
+        let (_, sent) = build_translate_request(&t("T", "D", "B"), "ko");
+        let err = parse_translate_response(
+            r#"{"ok":false,"translations":["T","D","B"]}"#,
+            &sent,
+            &t("T", "D", "B"),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("ok:false"), "got: {err}");
+    }
+
+    #[test]
+    fn ok_array_with_a_false_flag_is_a_hard_failure() {
+        let (_, sent) = build_translate_request(&t("T", "", "B"), "ko");
+        let err = parse_translate_response(
+            r#"{"ok":[true,false],"translations":["T","B"]}"#,
+            &sent,
+            &t("T", "", "B"),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("ok[1]=false"), "got: {err}");
+        assert!(format!("{err}").contains("`body`"), "names the failed field: {err}");
+    }
+
+    #[test]
+    fn ok_all_true_or_absent_still_passes() {
+        // Older deployments send no `ok` at all; newer ones send all-true.
+        // Both must keep working — guard against over-tightening the #1003 fix.
+        let (_, sent) = build_translate_request(&t("", "", "B"), "ja");
+        for body in [r#"{"ok":[true],"translations":["本文"]}"#, r#"{"translations":["本文"]}"#]
+        {
+            let out = parse_translate_response(body, &sent, &t("", "", "B")).unwrap();
+            assert_eq!(out.body, "本文");
+        }
+    }
+
+    #[test]
+    fn mirrored_error_code_1003_is_a_hard_failure() {
+        let (_, sent) = build_translate_request(&t("T", "", ""), "fr");
+        for body in [
+            r#"{"code":1003,"translations":["T"]}"#,
+            r#"{"status":1003,"translations":["T"]}"#,
+            r#"{"error_code":"1003","translations":["T"]}"#,
+        ] {
+            let err = parse_translate_response(body, &sent, &t("T", "", "")).unwrap_err();
+            assert!(format!("{err}").contains("1003"), "body {body} -> {err}");
+        }
+    }
+
+    #[test]
+    fn non_string_translation_is_an_error_not_a_blank() {
+        let (_, sent) = build_translate_request(&t("T", "D", "B"), "ko");
+        for body in [
+            r#"{"translations":[null,"D","B"]}"#,
+            r#"{"translations":[["T"],"D","B"]}"#,
+            r#"{"translations":[{"v":"T"},"D","B"]}"#,
+        ] {
+            let err = parse_translate_response(body, &sent, &t("T", "D", "B")).unwrap_err();
+            assert!(format!("{err}").contains("`title` is not a string"), "body {body} -> {err}");
+        }
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn translate_timeout_env_default_floor_and_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { env::remove_var("TRANSLATE_TIMEOUT") };
+        assert_eq!(timeout_from_env().unwrap(), Duration::from_secs(300));
+        unsafe { env::set_var("TRANSLATE_TIMEOUT", "900") };
+        assert_eq!(timeout_from_env().unwrap(), Duration::from_secs(900));
+        unsafe { env::set_var("TRANSLATE_TIMEOUT", "3") };
+        assert_eq!(timeout_from_env().unwrap(), Duration::from_secs(30));
+        unsafe { env::set_var("TRANSLATE_TIMEOUT", "  ") };
+        assert_eq!(timeout_from_env().unwrap(), Duration::from_secs(300));
+        unsafe { env::set_var("TRANSLATE_TIMEOUT", "soon") };
+        assert!(timeout_from_env().is_err());
+        unsafe { env::remove_var("TRANSLATE_TIMEOUT") };
+    }
+
+    /// Minimal keep-alive HTTP/1.1 server for exercising [`TranslateApiClient`]
+    /// over a real socket. Serves one JSON body per request, built from the
+    /// request's `texts` length; counts sockets and requests so tests can
+    /// assert on connection reuse.
+    struct TinyServer {
+        url: String,
+        conns: Arc<AtomicUsize>,
+        reqs: Arc<AtomicUsize>,
+    }
+
+    impl TinyServer {
+        fn start(make_body: fn(usize) -> String) -> Self {
+            use std::io::Write;
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let reqs = Arc::new(AtomicUsize::new(0));
+            let (c2, r2) = (conns.clone(), reqs.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    while let Some(body) = read_request_body(&mut stream) {
+                        let n = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v["texts"].as_array().map(|a| a.len()))
+                            .unwrap_or(0);
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        let out = make_body(n);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                            out.len(),
+                            out
+                        );
+                        if stream.write_all(resp.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
+        }
+    }
+
+    /// Read one request (headers + Content-Length body) off the stream; None on EOF.
+    fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
+        use std::io::Read;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let hdr_end = loop {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let headers = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_uppercase();
+        let cl: usize = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("CONTENT-LENGTH:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < hdr_end + cl {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Some(String::from_utf8_lossy(&buf[hdr_end..]).into_owned())
+    }
+
+    #[test]
+    fn ok_false_over_http_writes_no_sibling() {
+        // #1003 end-to-end: HTTP 200 + ok:false + source-text echo must NOT
+        // produce `.es.md`/`.fr.md` stamped as fresh translations.
+        let fx = Fixture::new();
+        fx.write_page("content/post/index.md", en_page_fm(), "Body one.\n");
+        let server = TinyServer::start(|n| {
+            json!({"ok": false, "translations": vec!["passthrough"; n]}).to_string()
+        });
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30)).unwrap();
+        let res = translate_with(fx.root(), &fx.config(), None, false, "", &client);
+        assert!(res.is_err(), "ok:false must surface as a failure");
+        assert!(!fx.root().join("content/post/index.es.md").exists(), "must not write es");
+        assert!(!fx.root().join("content/post/index.fr.md").exists(), "must not write fr");
+        assert!(server.reqs.load(Ordering::SeqCst) >= 2, "both langs attempted");
+    }
+
+    #[test]
+    fn mirrored_1003_over_http_writes_no_sibling() {
+        let fx = Fixture::new();
+        fx.write_page("content/post/index.md", en_page_fm(), "Body one.\n");
+        let server = TinyServer::start(|n| {
+            json!({"code": 1003, "translations": vec!["passthrough"; n]}).to_string()
+        });
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30)).unwrap();
+        let res = translate_with(fx.root(), &fx.config(), None, false, "", &client);
+        assert!(res.is_err(), "mirrored error code 1003 must surface as a failure");
+        assert!(!fx.root().join("content/post/index.es.md").exists(), "must not write es");
+        assert!(!fx.root().join("content/post/index.fr.md").exists(), "must not write fr");
+    }
+
+    #[test]
+    fn http_client_is_built_once_and_reused_across_chunks() {
+        // A chunked body issues several sequential requests; a client built
+        // per request would open a TCP connection per chunk. The pooled client
+        // built once per run must keep them on ONE connection.
+        let fx = Fixture::new();
+        let body = (0..10)
+            .map(|i| format!("## H{i}\n\n{}", "word ".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        fx.write_page("content/post/index.md", en_page_fm(), &body);
+        let server = TinyServer::start(|n| {
+            json!({
+                "ok": vec![true; n],
+                "translations": (0..n).map(|i| format!("Curriculo {i}")).collect::<Vec<_>>(),
+            })
+            .to_string()
+        });
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30)).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, "", &client).unwrap();
+        let reqs = server.reqs.load(Ordering::SeqCst);
+        let conns = server.conns.load(Ordering::SeqCst);
+        assert!(reqs > 2, "expected several chunked requests, got {reqs}");
+        assert_eq!(conns, 1, "all requests must share one pooled connection, got {conns}");
+        assert!(fx.root().join("content/post/index.es.md").exists());
     }
 
     struct EchoClient {
@@ -966,11 +1261,8 @@ mod tests {
         let h2 = "## Part\n\n";
         let para = "Curriculo ".repeat(1200);
         let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
-        let en = Translatable {
-            title: "Big Curriculo page".into(),
-            description: "desc".into(),
-            body,
-        };
+        let en =
+            Translatable { title: "Big Curriculo page".into(), description: "desc".into(), body };
         let c = CountingClient { calls: Cell::new(0) };
         let out = translate_fields(&c, &en, "es", "k").unwrap();
         assert!(c.calls.get() > 1, "chunked body should call translate more than once");
