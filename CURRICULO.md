@@ -9,7 +9,7 @@ behavior is unchanged; we add three subcommands used by `curriculo-tech/landing-
 | `v0.23.2-curriculo.1` | `zola translate` |
 | `v0.23.2-curriculo.2` | `zola graph migrate` / `graph refresh` |
 | `v0.23.2-curriculo.3` | Clean migrate extraction (metadata description, boilerplate strip, asset URL skip) |
-| `v0.23.2-curriculo.12` | `zola indexnow` — IndexNow ping for changed content |
+| `v0.23.2-curriculo.13` | `zola indexnow` — IndexNow ping for changed content |
 
 Landing CI pins the binary via `ZOLA_VERSION` / `ZOLA_BIN_URL` (never `latest`).
 
