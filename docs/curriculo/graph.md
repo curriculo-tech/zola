@@ -111,6 +111,15 @@ retired — scraped/legacy URLs win when both exist.
 | `OPENROUTER_API_KEY` | GH Actions (landing) + agenix | migrate topics + every refresh |
 | `FIRECRAWL_API_KEY` | agenix → landing GH secret | **`migrate` only** |
 
+Optional env overrides (`v0.23.2-curriculo.14`+), routing enrichment through an
+OpenAI-compatible gateway (e.g. the product's litellm) instead of openrouter.ai
+— same pattern as translate's `TRANSLATE_URL`. Empty/unset → OpenRouter itself:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `OPENROUTER_URL` | `https://openrouter.ai/api/v1/chat/completions` | chat-completions endpoint |
+| `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | model id as the gateway names it (e.g. `auto`) |
+
 ## GH Actions (landing-website)
 
 - **`workflow_dispatch` `graph-migrate.yml`:** run **once** (or `--force` remigrate);
