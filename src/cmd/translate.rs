@@ -1,9 +1,11 @@
 //! `zola translate` — generate co-located translation siblings via OpenRouter.
 //!
-//! For each default-language page that has body content, for each non-default
-//! language in config.toml: the sibling `<slug>.<lang>.md` is *fresh* iff its
-//! `extra.source_hash` equals sha256 of the default page's translatable fields
-//! (title, description, body). Missing/stale siblings are (re)generated through
+//! For each default-language page or section that has a body or `[extra]` copy,
+//! for each non-default language in config.toml: the sibling `<slug>.<lang>.md`
+//! is *fresh* iff its `extra.source_hash` equals sha256 of the default page's
+//! translatable fields (title, description, body, `[extra]` copy leaves, see
+//! [`extra_copy_leaves`]). Output that changes the HTML tags or comes back
+//! untranslated is never written. Missing/stale siblings are (re)generated through
 //! OpenRouter, written with `extra.source_hash` set, and brand-token-gated
 //! (INV-5: a glossary token present in the source must survive verbatim, else
 //! the file is NOT written and counts as a failure).
@@ -34,7 +36,9 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Umbrella ADR-003: gpt-4o-mini only, no local models.
 const MODEL: &str = "openai/gpt-4o-mini";
 /// INV-5: brand tokens that must survive translation verbatim when present in source.
-const GLOSSARY: &[&str] = &["Curriculo", "CurriculoATS"];
+/// "Curriculo ATS" is the product name in the brand guide; "CurriculoATS" is
+/// the retired one-word form, kept so older sources still survive verbatim.
+const GLOSSARY: &[&str] = &["Curriculo", "Curriculo ATS", "CurriculoATS"];
 const MAX_TOKENS: u32 = 16384;
 /// Bodies larger than this are translated in H2-sized chunks so each OpenRouter
 /// call stays under the JSON output cap (the old 113 KB pillar hit truncation).
@@ -61,12 +65,47 @@ fn lang_name(code: &str) -> Option<&'static str> {
 }
 
 /// Translatable fields of a default-language page.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Translatable {
     pub title: String,
     pub description: String,
     pub body: String,
+    /// Copy-like string leaves of `[extra]` as (path, text), e.g.
+    /// (`v12.cards[1].title`, "Every score is argued"). A translation keeps
+    /// the paths and replaces the text. See [`extra_copy_leaves`].
+    pub extra: Vec<(String, String)>,
 }
+
+/// `[extra]` keys that never carry copy: ids, routes, hashes, machine data.
+const EXTRA_SKIP_KEYS: &[&str] = &[
+    "source_hash",
+    "content_hash",
+    "canonical",
+    "source_url",
+    "template",
+    "slug",
+    "id",
+    "app",
+    "author",
+    "date",
+    "updated",
+    "path",
+    "url",
+    "href",
+    "src",
+    "image",
+    "img",
+    "shot",
+    "icon",
+    "glyph",
+    "class",
+    "lang",
+    "jsonld",
+    "noindex",
+];
+/// Key suffixes with the same meaning as [`EXTRA_SKIP_KEYS`].
+const EXTRA_SKIP_SUFFIXES: &[&str] =
+    &["_url", "_href", "_src", "_path", "_id", "_icon", "_class", "_image", "_img", "_hash"];
 
 /// LLM translation client. A trait so unit tests inject a mock without a network.
 pub trait LlmClient {
@@ -351,7 +390,15 @@ fn openrouter_translate_once(
     key: &str,
     body_only: bool,
 ) -> Result<Translatable> {
-    let name = lang_name(lang).ok_or_else(|| anyhow!("unsupported target language {lang:?}"))?;
+    // Any code works: a language outside the named set is described by its code,
+    // so adding a language to config.toml is enough to translate into it.
+    let name =
+        lang_name(lang).map(str::to_string).unwrap_or_else(|| format!("the language {lang}"));
+    let extra_texts: Vec<&str> = if body_only {
+        Vec::new()
+    } else {
+        fields.extra.iter().map(|(_, text)| text.as_str()).collect()
+    };
     let system = if body_only {
         format!(
             "You translate marketing web page BODY markdown into {name}. Translate ONLY human-readable text. \
@@ -364,7 +411,9 @@ fn openrouter_translate_once(
         format!(
             "You translate marketing web content into {name}. Translate ONLY human-readable text. \
             Preserve these brand tokens verbatim, untranslated: {}. \
-            Return a single JSON object with exactly these keys: title, description, body. No prose.",
+            Return a single JSON object with exactly these keys: title, description, body, extra. \
+            `extra` is an array of short UI strings: return an array of the same length, \
+            translated item for item in the same order. Keep HTML tags exactly as they are. No prose.",
             GLOSSARY.join(", ")
         )
     };
@@ -377,7 +426,8 @@ fn openrouter_translate_once(
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": json!({
-                "title": user_title, "description": user_desc, "body": fields.body
+                "title": user_title, "description": user_desc, "body": fields.body,
+                "extra": extra_texts,
             }).to_string()},
         ],
     });
@@ -401,11 +451,38 @@ fn openrouter_translate_once(
     let out: Value = serde_json::from_str(content).map_err(|_| {
         anyhow!("model returned non-JSON (likely truncated at output cap): {}", take160(content))
     })?;
+    let extra =
+        if body_only { Vec::new() } else { parse_extra_reply(&out["extra"], &fields.extra)? };
     Ok(Translatable {
         title: out["title"].as_str().unwrap_or("").to_string(),
         description: out["description"].as_str().unwrap_or("").to_string(),
         body: out["body"].as_str().unwrap_or("").to_string(),
+        extra,
     })
+}
+
+/// Pair the model's `extra` array back onto the source paths. A missing,
+/// short or non-string array is an error, never a silent shift or a blank.
+fn parse_extra_reply(reply: &Value, source: &[(String, String)]) -> Result<Vec<(String, String)>> {
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items = reply
+        .as_array()
+        .ok_or_else(|| anyhow!("model reply has no `extra` array ({} expected)", source.len()))?;
+    if items.len() != source.len() {
+        bail!("model reply `extra` has {} item(s), expected {}", items.len(), source.len());
+    }
+    source
+        .iter()
+        .zip(items)
+        .map(|((path, _), item)| {
+            let text = item.as_str().ok_or_else(|| {
+                anyhow!("model reply `extra` item for {path} is {}", json_kind(item))
+            })?;
+            Ok((path.clone(), text.to_string()))
+        })
+        .collect()
 }
 
 /// Split a long markdown body on H2 boundaries for chunked translation.
@@ -459,11 +536,7 @@ fn translate_fields<C: LlmClient>(
     translate_fields_impl(
         |f, body_only| {
             let payload = if body_only {
-                Translatable {
-                    title: String::new(),
-                    description: String::new(),
-                    body: f.body.clone(),
-                }
+                Translatable { body: f.body.clone(), ..Translatable::default() }
             } else {
                 f.clone()
             };
@@ -481,26 +554,29 @@ where
     if chunks.len() == 1 {
         return translate_one(fields, false);
     }
-    let head = Translatable {
-        title: fields.title.clone(),
-        description: fields.description.clone(),
-        body: chunks[0].clone(),
-    };
+    // Title, description and [extra] ride with the first chunk only.
+    let head = Translatable { body: chunks[0].clone(), ..fields.clone() };
     let first = translate_one(&head, false)?;
     let mut body_out = first.body;
     for chunk in chunks.iter().skip(1) {
-        let partial =
-            Translatable { title: String::new(), description: String::new(), body: chunk.clone() };
+        let partial = Translatable { body: chunk.clone(), ..Translatable::default() };
         let t = translate_one(&partial, true)?;
         if !body_out.is_empty() && !t.body.is_empty() {
             body_out.push_str("\n\n");
         }
         body_out.push_str(&t.body);
     }
-    Ok(Translatable { title: first.title, description: first.description, body: body_out })
+    Ok(Translatable {
+        title: first.title,
+        description: first.description,
+        body: body_out,
+        extra: first.extra,
+    })
 }
 
 /// sha256 over the translatable fields, NUL-separated for an unambiguous boundary.
+/// `[extra]` copy is appended only when present, so a page without any keeps
+/// the hash it had before `[extra]` was translated and is not re-translated.
 pub fn source_hash(t: &Translatable) -> String {
     let mut h = Sha256::new();
     h.update(t.title.as_bytes());
@@ -508,20 +584,307 @@ pub fn source_hash(t: &Translatable) -> String {
     h.update(t.description.as_bytes());
     h.update(b"\x00");
     h.update(t.body.as_bytes());
+    for (path, text) in &t.extra {
+        h.update(b"\x00");
+        h.update(path.as_bytes());
+        h.update(b"\x1f");
+        h.update(text.as_bytes());
+    }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every translated text in field order, for whole-page checks.
+fn all_texts(t: &Translatable) -> impl Iterator<Item = &str> {
+    [t.title.as_str(), t.description.as_str(), t.body.as_str()]
+        .into_iter()
+        .chain(t.extra.iter().map(|(_, text)| text.as_str()))
 }
 
 /// INV-5 post-check: every glossary token in the source must appear verbatim in
 /// the translation. Failure ⇒ the caller must NOT write the file.
 pub fn glossary_ok(en: &Translatable, t: &Translatable) -> Result<()> {
-    let en_blob = format!("{} {} {}", en.title, en.description, en.body);
-    let t_blob = format!("{} {} {}", t.title, t.description, t.body);
+    let en_blob = all_texts(en).collect::<Vec<_>>().join(" ");
+    let t_blob = all_texts(t).collect::<Vec<_>>().join(" ");
     for token in GLOSSARY {
         if en_blob.contains(token) && !t_blob.contains(token) {
             bail!("glossary: brand token {token:?} lost in translation");
         }
     }
     Ok(())
+}
+
+/// Post-check: the translation carries the same HTML tags as the source, and no
+/// new bare `<` (a `<` not opening a tag, e.g. "<20 min"). A lost `</a>` or a
+/// stray `<5` makes the HTML minifier drop `</article></main>` and the footer
+/// renders inside the article, so such output is never written.
+/// Also rejects an empty field for a non-empty source (a blank title or CTA),
+/// and a change in the count of code fences, shortcodes or markdown link
+/// targets, which a model that rewrites code or URLs leaves behind.
+pub fn markup_ok(en: &Translatable, t: &Translatable) -> Result<()> {
+    let pairs = [("title", &en.title, &t.title), ("description", &en.description, &t.description)]
+        .into_iter()
+        .chain(std::iter::once(("body", &en.body, &t.body)))
+        .map(|(field, a, b)| (field.to_string(), a, b))
+        .chain(en.extra.iter().zip(&t.extra).map(|((p, a), (_, b))| (format!("extra.{p}"), a, b)));
+    for (field, source, translated) in pairs {
+        if !source.trim().is_empty() && translated.trim().is_empty() {
+            bail!("markup: {field} came back empty");
+        }
+    }
+    for mark in MARKUP_MARKS {
+        let (a, b) = (count_in(en, mark), count_in(t, mark));
+        if a != b {
+            bail!("markup: `{mark}` count changed in translation ({a}→{b})");
+        }
+    }
+    let source = tag_counts(&all_texts(en).collect::<Vec<_>>().join("\n"));
+    let translated = tag_counts(&all_texts(t).collect::<Vec<_>>().join("\n"));
+    if source.tags != translated.tags {
+        let diff: Vec<String> = source
+            .tags
+            .keys()
+            .chain(translated.tags.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|k| source.tags.get(*k) != translated.tags.get(*k))
+            .map(|k| {
+                let (name, close) = k;
+                let tag = if *close { format!("</{name}>") } else { format!("<{name}>") };
+                format!(
+                    "{tag} {}→{}",
+                    source.tags.get(k).unwrap_or(&0),
+                    translated.tags.get(k).unwrap_or(&0)
+                )
+            })
+            .collect();
+        bail!("markup: HTML tags changed in translation ({})", diff.join(", "));
+    }
+    if translated.bare_lt > source.bare_lt {
+        bail!("markup: translation adds a bare `<` that would open a bogus tag");
+    }
+    Ok(())
+}
+
+/// Markdown and Tera syntax a translation must carry over unchanged.
+const MARKUP_MARKS: &[&str] = &["```", "{{", "{%", "]("];
+
+fn count_in(t: &Translatable, mark: &str) -> usize {
+    all_texts(t).map(|s| s.matches(mark).count()).sum()
+}
+
+struct TagCounts {
+    /// (lowercased tag name, is closing tag) → count.
+    tags: std::collections::BTreeMap<(String, bool), usize>,
+    /// `<` not followed by a tag name, `/` or `!`.
+    bare_lt: usize,
+}
+
+fn tag_counts(text: &str) -> TagCounts {
+    let mut tags = std::collections::BTreeMap::new();
+    let mut bare_lt = 0;
+    let bytes = text.as_bytes();
+    for (i, _) in text.match_indices('<') {
+        let rest = &bytes[i + 1..];
+        let (close, rest) = match rest.first() {
+            Some(b'/') => (true, &rest[1..]),
+            _ => (false, rest),
+        };
+        match rest.first() {
+            Some(b'!') if !close => continue, // comment or doctype
+            Some(c) if c.is_ascii_alphabetic() => {
+                let name: String = rest
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                    .map(|c| (*c as char).to_ascii_lowercase())
+                    .collect();
+                *tags.entry((name, close)).or_insert(0) += 1;
+            }
+            _ => bare_lt += 1,
+        }
+    }
+    TagCounts { tags, bare_lt }
+}
+
+/// An unchanged string reads as untranslated prose when it has this many
+/// lowercase words ("Compare every major ATS")...
+const PASSTHROUGH_MIN_LOWER: usize = 2;
+/// ...or this many words in all, for Title Case headlines. Below both, it can
+/// legitimately read the same in both languages: "FAQ", names such as
+/// "Maria Fernanda Silva", "Curriculo ATS REST API".
+const PASSTHROUGH_MIN_WORDS: usize = 5;
+
+/// (lowercase-initial words, all words) of three or more letters that a
+/// translation would change: brand tokens and acronyms (`ATS`) do not count.
+fn translatable_words(text: &str) -> (usize, usize) {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| w.chars().count() >= 3)
+        .filter(|w| !GLOSSARY.contains(w) && !w.chars().all(char::is_uppercase))
+        .collect();
+    let lower = words.iter().filter(|w| w.starts_with(char::is_lowercase)).count();
+    (lower, words.len())
+}
+
+fn reads_as_prose(text: &str) -> bool {
+    let (lower, all) = translatable_words(text);
+    lower >= PASSTHROUGH_MIN_LOWER || all >= PASSTHROUGH_MIN_WORDS
+}
+
+/// Post-check for clients without a per-text `ok` flag: a body or string that
+/// reads as prose (see [`reads_as_prose`]) and comes back byte-identical was
+/// not translated, and stamping it fresh would keep it English forever.
+pub fn not_passthrough(en: &Translatable, t: &Translatable) -> Result<()> {
+    let pairs = [("title", &en.title, &t.title), ("description", &en.description, &t.description)]
+        .into_iter()
+        .chain(std::iter::once(("body", &en.body, &t.body)))
+        .map(|(field, a, b)| (field.to_string(), a, b))
+        .chain(
+            en.extra
+                .iter()
+                .zip(&t.extra)
+                .map(|((path, a), (_, b))| (format!("extra.{path}"), a, b)),
+        );
+    for (field, source, translated) in pairs {
+        if reads_as_prose(source) && source.trim() == translated.trim() {
+            bail!("passthrough: {field} came back untranslated");
+        }
+    }
+    Ok(())
+}
+
+/// Copy-like string leaves of a page's `[extra]` table, in document order.
+/// Skips keys that name ids, routes, hashes and machine data, and values that
+/// look like URLs, paths, slugs or embedded JSON.
+pub fn extra_copy_leaves(fm: &toml::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(extra) = fm.get("extra") {
+        collect_leaves(extra, "", &mut out);
+    }
+    out
+}
+
+fn collect_leaves(node: &toml::Value, path: &str, out: &mut Vec<(String, String)>) {
+    match node {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                // A quoted key with `.` or `[` cannot round-trip through a
+                // dotted path, so it is never sent rather than written back
+                // to the wrong place.
+                if is_skipped_key(key) || key.contains(['.', '[', ']']) {
+                    continue;
+                }
+                let child = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                collect_leaves(value, &child, out);
+            }
+        }
+        toml::Value::Array(items) => {
+            for (i, value) in items.iter().enumerate() {
+                collect_leaves(value, &format!("{path}[{i}]"), out);
+            }
+        }
+        toml::Value::String(text) if !path.is_empty() && is_copy(text) => {
+            out.push((path.to_string(), text.clone()));
+        }
+        _ => {}
+    }
+}
+
+fn is_skipped_key(key: &str) -> bool {
+    EXTRA_SKIP_KEYS.contains(&key) || EXTRA_SKIP_SUFFIXES.iter().any(|s| key.ends_with(s))
+}
+
+/// True when a string reads as human copy rather than an identifier.
+fn is_copy(text: &str) -> bool {
+    let text = text.trim();
+    if !text.chars().any(char::is_alphabetic) {
+        return false; // "01", "$50", "/ 04"
+    }
+    const MACHINE_PREFIXES: &[&str] =
+        &["/", "./", "../", "#", "{", "[", "http://", "https://", "mailto:", "tel:"];
+    if MACHINE_PREFIXES.iter().any(|p| text.starts_with(p)) {
+        return false;
+    }
+    // One token in lowercase ASCII with a separator is a slug, key or file
+    // name: "impact_scoring", "interface-essential-crown", "01-welcome.jpg".
+    let one_token = !text.contains(char::is_whitespace);
+    let slug_like = text.chars().all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+    });
+    if one_token && slug_like && text.contains(['_', '-', '.', '/']) {
+        return false;
+    }
+    // A language tag: "en-US", "pt-BR".
+    if let Some((lang, region)) = text.split_once('-') {
+        let is_lang = (2..=3).contains(&lang.len()) && lang.chars().all(|c| c.is_ascii_lowercase());
+        let is_region = (2..=4).contains(&region.len())
+            && region.chars().all(|c| c.is_ascii_alphanumeric())
+            && region.chars().any(|c| c.is_ascii_uppercase());
+        if one_token && is_lang && is_region {
+            return false;
+        }
+    }
+    // CSS values: "translateY(10px) rotate(3deg)", "var(--accent)".
+    let css_call = text.as_bytes().windows(3).any(|w| {
+        w[0].is_ascii_alphabetic() && w[1] == b'(' && (w[2].is_ascii_digit() || w[2] == b'-')
+    });
+    !css_call
+}
+
+/// Read the string at `path` (`a.b[2].c`) inside `extra`.
+fn get_leaf<'a>(extra: &'a toml::Value, path: &str) -> Option<&'a str> {
+    let mut node = extra;
+    for part in path_parts(path) {
+        node = match (node, part) {
+            (toml::Value::Table(t), PathPart::Key(k)) => t.get(k)?,
+            (toml::Value::Array(a), PathPart::Index(i)) => a.get(i)?,
+            _ => return None,
+        };
+    }
+    node.as_str()
+}
+
+/// Write `text` at `path` (`a.b[2].c`) inside `extra`. False when the path
+/// does not resolve to a string, so the caller never stamps a sibling that
+/// still carries the English leaf.
+fn set_leaf(extra: &mut toml::Value, path: &str, text: &str) -> bool {
+    let mut node = extra;
+    for part in path_parts(path) {
+        let next = match (node, part) {
+            (toml::Value::Table(t), PathPart::Key(k)) => t.get_mut(k),
+            (toml::Value::Array(a), PathPart::Index(i)) => a.get_mut(i),
+            _ => None,
+        };
+        match next {
+            Some(n) => node = n,
+            None => return false,
+        }
+    }
+    if !node.is_str() {
+        return false;
+    }
+    *node = toml::Value::String(text.to_string());
+    true
+}
+
+enum PathPart<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+fn path_parts(path: &str) -> Vec<PathPart<'_>> {
+    let mut parts = Vec::new();
+    for segment in path.split('.') {
+        let (key, indexes) = segment.split_once('[').unwrap_or((segment, ""));
+        if !key.is_empty() {
+            parts.push(PathPart::Key(key));
+        }
+        for index in indexes.split('[').filter(|s| !s.is_empty()) {
+            if let Ok(i) = index.trim_end_matches(']').parse() {
+                parts.push(PathPart::Index(i));
+            }
+        }
+    }
+    parts
 }
 
 /// Entry point from `main.rs`. Reads `OPENROUTER_API_KEY` (fail-fast when absent
@@ -601,14 +964,10 @@ pub fn translate_with<C: LlmClient>(
                 continue;
             }
         };
-        let en = Translatable {
-            title: get_str(&en_fm, "title"),
-            description: get_str(&en_fm, "description"),
-            body: en_body.trim().to_string(),
-        };
-        // ponytail: nothing meaningful to translate without a body (title-only
-        // stubs). They get picked up once real content is authored.
-        if en.body.is_empty() {
+        let en = page_source(&en_fm, &en_body);
+        // ponytail: nothing meaningful to translate without a body or [extra]
+        // copy (title-only stubs). They get picked up once content is authored.
+        if en.body.is_empty() && en.extra.is_empty() {
             continue;
         }
         let hash = source_hash(&en);
@@ -633,6 +992,8 @@ pub fn translate_with<C: LlmClient>(
             calls += 1;
             match client.translate(&en, lang, &key).and_then(|t| {
                 glossary_ok(&en, &t)?;
+                markup_ok(&en, &t)?;
+                not_passthrough(&en, &t)?;
                 Ok(t)
             }) {
                 Ok(t) => {
@@ -675,6 +1036,8 @@ struct BatchJob {
 enum BatchSlot {
     Title,
     Description,
+    /// Index into the job's `en.extra`.
+    Extra(usize),
     Body(usize),
 }
 
@@ -731,14 +1094,10 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
                 continue;
             }
         };
-        let en = Translatable {
-            title: get_str(&en_fm, "title"),
-            description: get_str(&en_fm, "description"),
-            body: en_body.trim().to_string(),
-        };
-        // ponytail: nothing meaningful to translate without a body (title-only
-        // stubs). They get picked up once real content is authored.
-        if en.body.is_empty() {
+        let en = page_source(&en_fm, &en_body);
+        // ponytail: nothing meaningful to translate without a body or [extra]
+        // copy (title-only stubs). They get picked up once content is authored.
+        if en.body.is_empty() && en.extra.is_empty() {
             continue;
         }
         let hash = source_hash(&en);
@@ -785,9 +1144,9 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
             continue;
         }
 
-        // Flatten: per job, title → description → body chunks, in field order
-        // (empty fields are not sent). Every job has ≥1 text — bodies are
-        // non-empty by the skip above.
+        // Flatten: per job, title → description → [extra] copy → body chunks,
+        // in field order (empty fields are not sent). Every job has ≥1 text —
+        // a job has a body or [extra] copy by the skip above.
         let mut flat: Vec<FlatText> = Vec::new();
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(lang_jobs.len());
         for (ji, job) in lang_jobs.iter().enumerate() {
@@ -802,8 +1161,13 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
                     text: job.en.description.clone(),
                 });
             }
-            for (ci, chunk) in chunk_body(&job.en.body).iter().enumerate() {
-                flat.push(FlatText { job: ji, slot: BatchSlot::Body(ci), text: chunk.clone() });
+            for (ei, (_, text)) in job.en.extra.iter().enumerate() {
+                flat.push(FlatText { job: ji, slot: BatchSlot::Extra(ei), text: text.clone() });
+            }
+            if !job.en.body.is_empty() {
+                for (ci, chunk) in chunk_body(&job.en.body).iter().enumerate() {
+                    flat.push(FlatText { job: ji, slot: BatchSlot::Body(ci), text: chunk.clone() });
+                }
             }
             ranges.push((start, flat.len()));
         }
@@ -870,11 +1234,7 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
                 continue; // already counted + logged above
             }
             let (start, end) = ranges[ji];
-            let mut t = Translatable {
-                title: String::new(),
-                description: String::new(),
-                body: String::new(),
-            };
+            let mut t = Translatable::default();
             let mut ok_all = true;
             let mut body_seen = 0usize;
             for i in start..end {
@@ -890,6 +1250,7 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
                 match flat[i].slot {
                     BatchSlot::Title => t.title = s.clone(),
                     BatchSlot::Description => t.description = s.clone(),
+                    BatchSlot::Extra(ei) => t.extra.push((job.en.extra[ei].0.clone(), s.clone())),
                     BatchSlot::Body(ci) => {
                         // Chunks reassemble in request order — the slot index
                         // is that invariant, so it is checked, not assumed.
@@ -910,7 +1271,7 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
                 );
                 continue;
             }
-            if let Err(e) = glossary_ok(&job.en, &t) {
+            if let Err(e) = glossary_ok(&job.en, &t).and_then(|()| markup_ok(&job.en, &t)) {
                 failures += 1;
                 log::error!("translate: {} → {lang} FAILED: {e}", job.page.display());
                 continue; // file intentionally NOT written on failure
@@ -928,6 +1289,247 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
         bail!("translate completed with {failures} failure(s)");
     }
     Ok(())
+}
+
+/// `zola translate --adopt`: stamp existing siblings that already hold a
+/// complete translation of the current source (written by hand, say) as fresh,
+/// so a later run does not replace them. No network and no key. A sibling is
+/// adopted only when every `[extra]` copy path is present and the same checks a
+/// machine translation must pass hold: glossary, markup, not left in English.
+/// Nothing but `extra.source_hash` changes in an adopted file.
+pub fn adopt(root_dir: &Path, config_file: &Path) -> Result<()> {
+    let (mut adopted, mut rejected, mut fresh) = (0usize, 0usize, 0usize);
+    for_each_sibling(root_dir, config_file, |sib| {
+        if sib.is_fresh() {
+            fresh += 1;
+            return Ok(());
+        }
+        match sib.check() {
+            Ok(()) => {
+                sib.write_hash(Some(sib.hash))?;
+                adopted += 1;
+                log::info!("translate --adopt: {} adopted", sib.path.display());
+            }
+            Err(e) => {
+                rejected += 1;
+                log::warn!("translate --adopt: {} not adopted: {e}", sib.path.display());
+            }
+        }
+        Ok(())
+    })?;
+    log::info!("translate --adopt: adopted={adopted} rejected={rejected} fresh={fresh}");
+    Ok(())
+}
+
+/// `zola translate --recheck`: run the output checks on siblings already
+/// stamped fresh and remove the stamp from any that fail (English left in
+/// place, HTML tags lost, brand token dropped, `[extra]` copy missing), so the
+/// next `zola translate` run regenerates them. No network and no key; copy is
+/// never changed. Fails when it cleared anything, so CI surfaces it.
+pub fn recheck(root_dir: &Path, config_file: &Path) -> Result<()> {
+    let (mut cleared, mut passed) = (0usize, 0usize);
+    for_each_sibling(root_dir, config_file, |sib| {
+        if !sib.is_fresh() {
+            return Ok(()); // stale or unstamped: translate already redoes it
+        }
+        match sib.check() {
+            Ok(()) => passed += 1,
+            Err(e) => {
+                sib.write_hash(None)?;
+                cleared += 1;
+                log::warn!("translate --recheck: {} cleared: {e}", sib.path.display());
+            }
+        }
+        Ok(())
+    })?;
+    log::info!("translate --recheck: cleared={cleared} passed={passed}");
+    if cleared > 0 {
+        bail!(
+            "translate --recheck cleared {cleared} sibling(s); run `zola translate` to redo them"
+        );
+    }
+    Ok(())
+}
+
+/// An existing sibling of a default-language page, with its source.
+struct Sibling<'a> {
+    path: &'a Path,
+    en: &'a Translatable,
+    hash: &'a str,
+    fm: toml::Value,
+    body: String,
+}
+
+impl Sibling<'_> {
+    fn is_fresh(&self) -> bool {
+        extra_hash(&self.fm).as_deref() == Some(self.hash)
+    }
+
+    /// The checks a machine translation must pass before it is written.
+    fn check(&self) -> Result<()> {
+        let t = sibling_translation(self.en, &self.fm, &self.body)?;
+        glossary_ok(self.en, &t)?;
+        markup_ok(self.en, &t)?;
+        not_passthrough(self.en, &t)
+    }
+
+    /// Set (`Some`) or remove (`None`) `extra.source_hash`; nothing else changes.
+    /// The `source_hash` line is edited in place so hand-written front matter
+    /// keeps its order and comments; the front matter is re-serialized only
+    /// when the line edit does not parse back to the expected value.
+    fn write_hash(&self, hash: Option<&str>) -> Result<()> {
+        let mut fm = self.fm.clone();
+        match hash {
+            Some(h) => stamp_hash(&mut fm, h),
+            None => {
+                if let Some(et) = fm.get_mut("extra").and_then(|e| e.as_table_mut()) {
+                    et.remove("source_hash");
+                }
+            }
+        }
+        let text = fs::read_to_string(self.path)?;
+        let edited =
+            rewrite_hash_line(&text, hash).filter(|t| front_matter_of(t).as_ref() == Some(&fm));
+        let out = match edited {
+            Some(t) => t,
+            None => {
+                let fm_str =
+                    toml::to_string(&fm).map_err(|e| anyhow!("serialize frontmatter: {e}"))?;
+                format!("+++\n{fm_str}+++\n{}", self.body)
+            }
+        };
+        fs::write(self.path, out)?;
+        Ok(())
+    }
+}
+
+/// `text` with the `[extra]` `source_hash = "..."` line set to `hash` (added
+/// under `[extra]`, or in a new `[extra]` table, when missing) or removed
+/// (`None`). Line endings and every other line are kept. `None` when the
+/// front matter delimiters are not found.
+fn rewrite_hash_line(text: &str, hash: Option<&str>) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if lines.first()?.trim() != FM_DELIM {
+        return None;
+    }
+    let close = 1 + lines[1..].iter().position(|l| l.trim() == FM_DELIM)?;
+    let eol = if lines[0].ends_with("\r\n") { "\r\n" } else { "\n" };
+    let (mut table, mut header, mut existing) = (String::new(), None, None);
+    for (i, line) in lines.iter().enumerate().take(close).skip(1) {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            table = trimmed.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            if table == "extra" {
+                header = Some(i);
+            }
+        } else if table == "extra"
+            && trimmed.split('=').next().map(str::trim) == Some("source_hash")
+        {
+            existing = Some(i);
+        }
+    }
+    let new_line = hash.map(|h| format!("source_hash = \"{h}\"{eol}"));
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    match (existing, new_line) {
+        (Some(i), Some(l)) => out[i] = l,
+        (Some(i), None) => {
+            out.remove(i);
+        }
+        (None, Some(l)) => match header {
+            Some(h) => out.insert(h + 1, l),
+            None => out.insert(close, format!("[extra]{eol}{l}")),
+        },
+        (None, None) => {}
+    }
+    Some(out.concat())
+}
+
+/// The parsed TOML front matter of a page's full text.
+fn front_matter_of(text: &str) -> Option<toml::Value> {
+    let mut parts = text.splitn(3, FM_DELIM);
+    parts.next()?;
+    toml::from_str(parts.next()?).ok()
+}
+
+/// Visit every existing sibling of every translatable default-language page.
+fn for_each_sibling<F>(root_dir: &Path, config_file: &Path, mut visit: F) -> Result<()>
+where
+    F: FnMut(&Sibling<'_>) -> Result<()>,
+{
+    let (_default_lang, langs) = read_langs(config_file)?;
+    let lang_set: HashSet<&str> = langs.iter().map(|s| s.as_str()).collect();
+    let mut pages: Vec<PathBuf> = Vec::new();
+    walk_md(&root_dir.join("content"), &mut pages)?;
+    pages.sort();
+    for page in &pages {
+        let name = page.file_name().unwrap().to_string_lossy().into_owned();
+        if !is_default_page(&name, &lang_set) {
+            continue;
+        }
+        let (en_fm, en_body) = match parse_page(page) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("translate: skipping {}: {e}", page.display());
+                continue;
+            }
+        };
+        let en = page_source(&en_fm, &en_body);
+        if en.body.is_empty() && en.extra.is_empty() {
+            continue;
+        }
+        let hash = source_hash(&en);
+        for lang in &langs {
+            let path = sibling_path(page, lang);
+            if !path.exists() {
+                continue; // missing: translate creates it
+            }
+            let (fm, body) = match parse_page(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("translate: skipping {}: {e}", path.display());
+                    continue;
+                }
+            };
+            visit(&Sibling { path: &path, en: &en, hash: &hash, fm, body })?;
+        }
+    }
+    Ok(())
+}
+
+/// The sibling's text at every path of the English source, or an error naming
+/// the first `[extra]` path it lacks.
+fn sibling_translation(
+    en: &Translatable,
+    sib_fm: &toml::Value,
+    sib_body: &str,
+) -> Result<Translatable> {
+    let empty = toml::Value::Table(toml::value::Table::new());
+    let sib_extra = sib_fm.get("extra").unwrap_or(&empty);
+    let extra = en
+        .extra
+        .iter()
+        .map(|(path, _)| {
+            get_leaf(sib_extra, path)
+                .map(|text| (path.clone(), text.to_string()))
+                .ok_or_else(|| anyhow!("missing extra.{path}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Translatable {
+        title: get_str(sib_fm, "title"),
+        description: get_str(sib_fm, "description"),
+        body: sib_body.trim().to_string(),
+        extra,
+    })
+}
+
+fn stamp_hash(fm: &mut toml::Value, hash: &str) {
+    if let Some(table) = fm.as_table_mut() {
+        let extra =
+            table.entry("extra").or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        if let Some(et) = extra.as_table_mut() {
+            et.insert("source_hash".into(), toml::Value::String(hash.to_string()));
+        }
+    }
 }
 
 // ---- helpers ----
@@ -962,16 +1564,24 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// True if `file_name` (`index.md`, `index.es.md`, `_index.md`, …) is a
-/// default-language page: not a section, not a per-language translation.
+/// True if `file_name` (`index.md`, `_index.md`, `index.es.md`, …) is a
+/// default-language page or section, not a per-language translation.
+/// Sections count: a homepage or section landing keeps its copy in `_index.md`.
 fn is_default_page(file_name: &str, lang_set: &HashSet<&str>) -> bool {
     let Some(stem) = file_name.strip_suffix(".md") else {
         return false;
     };
-    if stem.starts_with("_index") {
-        return false;
-    }
     !lang_set.iter().any(|l| stem.ends_with(&format!(".{l}")))
+}
+
+/// The translatable fields of a default-language page.
+fn page_source(fm: &toml::Value, body: &str) -> Translatable {
+    Translatable {
+        title: get_str(fm, "title"),
+        description: get_str(fm, "description"),
+        body: body.trim().to_string(),
+        extra: extra_copy_leaves(fm),
+    }
 }
 
 /// Split a `+++`-delimited page into (frontmatter, body markdown).
@@ -1024,14 +1634,34 @@ fn sibling_path(page: &Path, lang: &str) -> PathBuf {
     page.with_file_name(format!("{stem}.{lang}.md"))
 }
 
+/// Write the sibling from the English front matter with the translated fields
+/// and `[extra]` copy set at their paths. Top-level `[extra]` keys the English
+/// page does not have (a locale's own `noindex`, say) are kept from the
+/// existing sibling; everything else follows the English layout.
 fn write_sibling(path: &Path, en_fm: &toml::Value, t: &Translatable, hash: &str) -> Result<()> {
+    let existing_extra = parse_page(path)
+        .ok()
+        .and_then(|(fm, _)| fm.get("extra").and_then(|e| e.as_table().cloned()))
+        .unwrap_or_default();
     let mut fm = en_fm.clone();
     if let Some(table) = fm.as_table_mut() {
-        table.insert("title".into(), toml::Value::String(t.title.clone()));
-        table.insert("description".into(), toml::Value::String(t.description.clone()));
+        if !t.title.is_empty() || table.contains_key("title") {
+            table.insert("title".into(), toml::Value::String(t.title.clone()));
+        }
+        if !t.description.is_empty() || table.contains_key("description") {
+            table.insert("description".into(), toml::Value::String(t.description.clone()));
+        }
         let extra =
             table.entry("extra").or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        for (leaf, text) in &t.extra {
+            if !set_leaf(extra, leaf, text) {
+                bail!("{}: extra.{leaf} has no string to translate into", path.display());
+            }
+        }
         if let Some(et) = extra.as_table_mut() {
+            for (key, value) in existing_extra {
+                et.entry(key).or_insert(value);
+            }
             et.insert("source_hash".into(), toml::Value::String(hash.to_string()));
         }
     }
@@ -1110,7 +1740,12 @@ mod tests {
     // ── TranslateApiClient wire format ────────────────────────────────
 
     fn t(title: &str, description: &str, body: &str) -> Translatable {
-        Translatable { title: title.into(), description: description.into(), body: body.into() }
+        Translatable {
+            title: title.into(),
+            description: description.into(),
+            body: body.into(),
+            ..Translatable::default()
+        }
     }
 
     #[test]
@@ -1598,8 +2233,12 @@ mod tests {
         let expected = chunk_body(&body).join("\n\n");
         assert_eq!(written.trim(), expected, "chunks must rejoin in request order");
         // …and the hash stamp matches the en fields, so the pair is now fresh.
-        let en =
-            Translatable { title: "T".into(), description: "D".into(), body: body.trim().into() };
+        let en = Translatable {
+            title: "T".into(),
+            description: "D".into(),
+            body: body.trim().into(),
+            ..Translatable::default()
+        };
         assert_eq!(extra_hash(&fm).as_deref(), Some(source_hash(&en).as_str()));
     }
 
@@ -1678,6 +2317,7 @@ mod tests {
                 title: format!("P{i}"),
                 description: format!("D{i}"),
                 body: format!("Body {i}."),
+                ..Translatable::default()
             };
             assert_eq!(extra_hash(&fm).as_deref(), Some(source_hash(&en).as_str()), "page {i}");
         }
@@ -1769,6 +2409,7 @@ mod tests {
             title: "Hello Curriculo".into(),
             description: "A desc".into(),
             body: "Body one.".into(),
+            ..Translatable::default()
         };
         let (fm, _) = parse_page(&fx.root().join("content/post/index.md")).unwrap();
         write_sibling(&fx.root().join("content/post/index.es.md"), &fm, &en, &source_hash(&en))
@@ -1790,6 +2431,7 @@ mod tests {
                 title: format!("[{lang}] {}", f.title),
                 description: format!("[{lang}] {}", f.description),
                 body: format!("[{lang}] {}", f.body),
+                extra: f.extra.iter().map(|(p, s)| (p.clone(), format!("[{lang}] {s}"))).collect(),
             })
         }
     }
@@ -1802,6 +2444,11 @@ mod tests {
                 title: f.title.replace("Curriculo", "Brand"),
                 description: f.description.replace("Curriculo", "Brand"),
                 body: f.body.replace("Curriculo", "Brand"),
+                extra: f
+                    .extra
+                    .iter()
+                    .map(|(p, s)| (p.clone(), s.replace("Curriculo", "Brand")))
+                    .collect(),
             })
         }
     }
@@ -1897,20 +2544,16 @@ mod tests {
 
     #[test]
     fn source_hash_is_deterministic_and_field_scoped() {
-        let a = Translatable { title: "t".into(), description: "d".into(), body: "b".into() };
-        let b = Translatable { title: "t".into(), description: "d".into(), body: "b".into() };
-        let c = Translatable { title: "t".into(), description: "d".into(), body: "B".into() };
+        let a = t("t", "d", "b");
+        let b = t("t", "d", "b");
+        let c = t("t", "d", "B");
         assert_eq!(source_hash(&a), source_hash(&b));
         assert_ne!(source_hash(&a), source_hash(&c));
     }
 
     #[test]
     fn glossary_passes_when_token_preserved() {
-        let en = Translatable {
-            title: "Welcome to Curriculo".into(),
-            description: "".into(),
-            body: "".into(),
-        };
+        let en = t("Welcome to Curriculo", "", "");
         let ok = Translatable { title: "Bienvenue sur Curriculo".into(), ..en.clone() };
         let lost = Translatable { title: "Bienvenue sur Brand".into(), ..en.clone() };
         assert!(glossary_ok(&en, &ok).is_ok());
@@ -1947,6 +2590,7 @@ mod tests {
                     format!("[{lang}] {}", f.description)
                 },
                 body: format!("[{lang}] {}", f.body),
+                extra: f.extra.iter().map(|(p, s)| (p.clone(), format!("[{lang}] {s}"))).collect(),
             })
         }
     }
@@ -1956,12 +2600,375 @@ mod tests {
         let h2 = "## Part\n\n";
         let para = "Curriculo ".repeat(1200);
         let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
-        let en =
-            Translatable { title: "Big Curriculo page".into(), description: "desc".into(), body };
+        let en = Translatable {
+            title: "Big Curriculo page".into(),
+            description: "desc".into(),
+            body,
+            ..Translatable::default()
+        };
         let c = CountingClient { calls: Cell::new(0) };
         let out = translate_fields(&c, &en, "es", "k").unwrap();
         assert!(c.calls.get() > 1, "chunked body should call translate more than once");
         assert!(out.body.contains("[es]"));
         assert!(out.title.contains("Curriculo"));
+    }
+
+    // ── [extra] copy, sections, output checks ──────────────────────────
+
+    fn extra_fm() -> &'static str {
+        "title = \"Home Curriculo\"\ndescription = \"Desc\"\n\
+         [extra]\ncanonical = \"https://x/\"\njsonld = '{\"@context\":\"https://schema.org\"}'\n\
+         [extra.hero]\ncta = \"Start Free\"\nlede = \"Curriculo reads the work.\"\nicon = \"interface-essential-crown\"\n\
+         [[extra.cards]]\nn = \"01\"\nlink = \"impact_scoring\"\ntitle = \"It reads the actual work\"\n\
+         items = [\"Portfolios and repositories\", \"Case studies\"]\nshot = \"/arb/01.jpg\"\n"
+    }
+
+    fn fm_of(fx: &Fixture, rel: &str) -> toml::Value {
+        parse_page(&fx.root().join(rel)).unwrap().0
+    }
+
+    #[test]
+    fn extra_copy_leaves_keep_copy_and_skip_ids_routes_and_json() {
+        let fm: toml::Value = toml::from_str(extra_fm()).unwrap();
+        let paths: Vec<String> = extra_copy_leaves(&fm).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "cards[0].items[0]",
+                "cards[0].items[1]",
+                "cards[0].title",
+                "hero.cta",
+                "hero.lede",
+            ],
+            "canonical, jsonld, icon, n, slug link and shot must never be sent"
+        );
+    }
+
+    #[test]
+    fn extra_copy_is_translated_and_written_at_its_paths() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/home/index.md", extra_fm(), "Body Curriculo.\n");
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+
+        let es = fm_of(&fx, "content/home/index.es.md");
+        let extra = &es["extra"];
+        assert_eq!(extra["hero"]["cta"].as_str(), Some("[es] Start Free"));
+        assert_eq!(extra["cards"][0]["items"][1].as_str(), Some("[es] Case studies"));
+        assert_eq!(extra["cards"][0]["title"].as_str(), Some("[es] It reads the actual work"));
+        // identifiers stay as the English page has them
+        assert_eq!(extra["hero"]["icon"].as_str(), Some("interface-essential-crown"));
+        assert_eq!(extra["cards"][0]["link"].as_str(), Some("impact_scoring"));
+        assert_eq!(extra["cards"][0]["shot"].as_str(), Some("/arb/01.jpg"));
+        assert!(extra["jsonld"].as_str().unwrap().starts_with('{'));
+        assert!(extra.get("source_hash").is_some());
+    }
+
+    #[test]
+    fn section_index_with_only_extra_copy_is_translated() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get(), 1);
+        let es = fm_of(&fx, "content/_index.es.md");
+        assert_eq!(es["extra"]["hero"]["lede"].as_str(), Some("[es] Curriculo reads the work."));
+        assert_eq!(es["title"].as_str(), Some("[es] Home Curriculo"));
+    }
+
+    #[test]
+    fn title_only_section_is_still_skipped() {
+        let fx = Fixture::new();
+        fx.write_page("content/blog/_index.md", "title = \"Blog\"\n", "\n");
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get(), 0);
+        assert!(!fx.root().join("content/blog/_index.es.md").exists());
+    }
+
+    #[test]
+    fn editing_extra_copy_marks_siblings_stale() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/home/index.md", extra_fm(), "Body Curriculo.\n");
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get(), 1, "unchanged page is fresh");
+
+        fx.write_page(
+            "content/home/index.md",
+            &extra_fm().replace("Start Free", "Start now"),
+            "Body Curriculo.\n",
+        );
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get(), 2, "an [extra] edit must regenerate the sibling");
+    }
+
+    #[test]
+    fn page_without_extra_copy_keeps_the_previous_hash() {
+        // Pre-[extra] formula: sha256(title \0 description \0 body).
+        let mut h = Sha256::new();
+        h.update(b"T\x00D\x00B");
+        let old: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(source_hash(&t("T", "D", "B")), old);
+        let with_extra = Translatable { extra: vec![("a".into(), "x".into())], ..t("T", "D", "B") };
+        assert_ne!(source_hash(&with_extra), old);
+    }
+
+    #[test]
+    fn sibling_only_extra_keys_survive_a_retranslation() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/home/index.md", extra_fm(), "Body Curriculo.\n");
+        fx.write_page(
+            "content/home/index.es.md",
+            "title = \"old\"\n[extra]\nnoindex = true\nsource_hash = \"stale\"\n",
+            "old body\n",
+        );
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        let es = fm_of(&fx, "content/home/index.es.md");
+        assert_eq!(es["extra"]["noindex"].as_bool(), Some(true));
+        assert_ne!(es["extra"]["source_hash"].as_str(), Some("stale"));
+    }
+
+    #[test]
+    fn markup_ok_rejects_a_lost_close_tag_and_a_new_bare_lt() {
+        let en = t("T", "", "<p>Read <a href=\"/x\">this</a> now.</p>");
+        let good = t("T", "", "<p>Lisez <a href=\"/x\">ceci</a> maintenant.</p>");
+        let lost = t("T", "", "<p>Lisez <a href=\"/x\">ceci maintenant.</p>");
+        let bare = t("T", "", "<p>Lisez <a href=\"/x\">ceci</a> en <20 min.</p>");
+        assert!(markup_ok(&en, &good).is_ok());
+        let err = markup_ok(&en, &lost).unwrap_err().to_string();
+        assert!(err.contains("</a>"), "{err}");
+        assert!(markup_ok(&en, &bare).is_err());
+        // a bare `<` already in the source may stay
+        let src_lt = t("T", "", "Setup in <20 min.");
+        assert!(markup_ok(&src_lt, &t("T", "", "Listo en <20 min.")).is_ok());
+    }
+
+    /// Mock that loses a closing tag.
+    struct TagDroppingClient;
+    impl LlmClient for TagDroppingClient {
+        fn translate(&self, f: &Translatable, lang: &str, _key: &str) -> Result<Translatable> {
+            Ok(Translatable {
+                title: format!("[{lang}] {}", f.title),
+                description: format!("[{lang}] {}", f.description),
+                body: format!("[{lang}] {}", f.body.replace("</a>", "")),
+                extra: f.extra.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn broken_markup_is_not_written() {
+        let fx = Fixture::new();
+        fx.write_page("content/post/index.md", en_page_fm(), "See <a href=\"/x\">Curriculo</a>.\n");
+        let res = translate_with(fx.root(), &fx.config(), None, false, "k", &TagDroppingClient);
+        assert!(res.is_err());
+        assert!(!fx.root().join("content/post/index.es.md").exists());
+    }
+
+    /// Mock that returns the source unchanged.
+    struct IdentityClient;
+    impl LlmClient for IdentityClient {
+        fn translate(&self, f: &Translatable, _lang: &str, _key: &str) -> Result<Translatable> {
+            Ok(f.clone())
+        }
+    }
+
+    #[test]
+    fn untranslated_body_is_not_stamped_fresh() {
+        let fx = Fixture::new();
+        fx.write_page(
+            "content/post/index.md",
+            en_page_fm(),
+            "Curriculo scores every candidate with written reasons.\n",
+        );
+        let res = translate_with(fx.root(), &fx.config(), None, false, "k", &IdentityClient);
+        assert!(res.unwrap_err().to_string().contains("failure"));
+        assert!(!fx.root().join("content/post/index.es.md").exists());
+    }
+
+    #[test]
+    fn short_strings_may_read_the_same_in_both_languages() {
+        let en = Translatable { extra: vec![("faq".into(), "FAQ".into())], ..t("Blog", "", "") };
+        assert!(not_passthrough(&en, &en.clone()).is_ok());
+        // brand tokens, acronyms and names are not words a translation changes
+        let api = t("Curriculo ATS REST API", "Curriculo ATS + Google Workspace", "");
+        assert!(not_passthrough(&api, &api.clone()).is_ok());
+        let names = t("Maria Fernanda Silva", "Google Cloud Platform", "");
+        assert!(not_passthrough(&names, &names.clone()).is_ok());
+        for prose in
+            ["Compare every major ATS", "Curriculo ATS vs Lever: Which AI ATS Is Right for You?"]
+        {
+            let en = t(prose, "", "");
+            assert!(not_passthrough(&en, &en.clone()).is_err(), "{prose}");
+        }
+    }
+
+    #[test]
+    fn non_copy_values_are_never_sent() {
+        for value in ["en-US", "pt-BR", "translateY(10px) rotate(3deg)", "var(--accent)"] {
+            assert!(!is_copy(value), "{value}");
+        }
+        for value in ["Portfolio", "Score (0–100)", "Start Free", "portfolio"] {
+            assert!(is_copy(value), "{value}");
+        }
+        let fm: toml::Value =
+            toml::from_str("[extra.faq]\n\"v1.0\" = \"Is it free?\"\nq = \"Is it free?\"\n")
+                .unwrap();
+        let paths: Vec<String> = extra_copy_leaves(&fm).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["faq.q"], "a dotted key cannot round-trip, so it is not sent");
+    }
+
+    #[test]
+    fn markup_ok_rejects_empty_fields_and_changed_code_or_links() {
+        let en = t("Title", "", "See [docs](/docs/) and `{{ x }}`.\n```\ncode\n```");
+        let ok = t("Titre", "", "Voir [docs](/docs/) et `{{ x }}`.\n```\ncode\n```");
+        assert!(markup_ok(&en, &ok).is_ok());
+        assert!(markup_ok(&en, &Translatable { title: String::new(), ..ok.clone() }).is_err());
+        let link_lost = Translatable { body: ok.body.replace("](/docs/)", ""), ..ok.clone() };
+        assert!(markup_ok(&en, &link_lost).unwrap_err().to_string().contains("]("));
+        let fence_lost = Translatable { body: ok.body.replace("```\ncode\n```", "code"), ..ok };
+        assert!(markup_ok(&en, &fence_lost).is_err());
+    }
+
+    #[test]
+    fn set_leaf_reports_a_path_that_does_not_resolve() {
+        let mut extra: toml::Value = toml::from_str("[hero]\ncta = \"x\"\nn = 1\n").unwrap();
+        assert!(set_leaf(&mut extra, "hero.cta", "y"));
+        assert!(!set_leaf(&mut extra, "hero.missing", "y"));
+        assert!(!set_leaf(&mut extra, "hero.n", "y"), "not a string");
+        assert!(!set_leaf(&mut extra, "hero.cta[0]", "y"));
+    }
+
+    #[test]
+    fn endpoint_sends_extra_copy_and_writes_it_back() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        let mock = MockBatch::new();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        let sent = mock.texts_of(0);
+        assert!(sent.contains(&"Start Free".to_string()));
+        assert!(sent.contains(&"Case studies".to_string()));
+        assert!(!sent.iter().any(|s| s.starts_with('{') || s == "impact_scoring" || s.is_empty()));
+        let es = fm_of(&fx, "content/_index.es.md");
+        assert_eq!(es["extra"]["cards"][0]["items"][1].as_str(), Some("Case studies"));
+        assert!(es["extra"].get("source_hash").is_some());
+    }
+
+    fn hand_es_fm() -> &'static str {
+        "title = \"Inicio Curriculo\"\ndescription = \"Desc es\"\n\
+         [extra]\nnoindex = false\n\
+         [extra.hero]\ncta = \"Empieza gratis\"\nlede = \"Curriculo lee el trabajo.\"\n\
+         [[extra.cards]]\ntitle = \"Lee el trabajo real\"\nitems = [\"Portafolios y repositorios\", \"Casos\"]\n"
+    }
+
+    #[test]
+    fn adopt_stamps_a_complete_hand_translation_and_translate_then_skips_it() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        fx.write_page("content/_index.es.md", hand_es_fm(), "\n");
+        adopt(fx.root(), &fx.config()).unwrap();
+
+        let es = fm_of(&fx, "content/_index.es.md");
+        assert_eq!(es["extra"]["hero"]["cta"].as_str(), Some("Empieza gratis"), "copy untouched");
+        assert!(es["extra"].get("source_hash").is_some());
+
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get(), 0, "an adopted sibling is fresh");
+    }
+
+    #[test]
+    fn adopt_refuses_a_sibling_missing_extra_copy() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        fx.write_page(
+            "content/_index.es.md",
+            &hand_es_fm().replace("cta = \"Empieza gratis\"\n", ""),
+            "\n",
+        );
+        adopt(fx.root(), &fx.config()).unwrap();
+        assert!(fm_of(&fx, "content/_index.es.md")["extra"].get("source_hash").is_none());
+    }
+
+    #[test]
+    fn adopt_refuses_a_sibling_whose_body_is_still_english() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        let body = "Curriculo scores every candidate with written reasons.\n";
+        fx.write_page("content/post/index.md", en_page_fm(), body);
+        fx.write_page("content/post/index.es.md", "title = \"Hola Curriculo\"\n", body);
+        adopt(fx.root(), &fx.config()).unwrap();
+        assert!(fm_of(&fx, "content/post/index.es.md").get("extra").is_none());
+    }
+
+    #[test]
+    fn recheck_clears_a_fresh_sibling_that_lost_markup_and_keeps_good_ones() {
+        let fx = Fixture::new();
+        let body = "See <a href=\"/x\">the scoring docs</a> for Curriculo.\n";
+        fx.write_page("content/a/index.md", en_page_fm(), body);
+        fx.write_page("content/b/index.md", en_page_fm(), body);
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        // Break one sibling the way older translations did: `</a>` dropped.
+        let broken = fx.root().join("content/a/index.es.md");
+        let text = fs::read_to_string(&broken).unwrap().replace("</a>", "");
+        fs::write(&broken, text).unwrap();
+
+        let err = recheck(fx.root(), &fx.config()).unwrap_err().to_string();
+        assert!(err.contains("cleared 1"), "{err}");
+        assert!(fm_of(&fx, "content/a/index.es.md")["extra"].get("source_hash").is_none());
+        assert!(fm_of(&fx, "content/b/index.es.md")["extra"].get("source_hash").is_some());
+        assert!(recheck(fx.root(), &fx.config()).is_ok(), "nothing left to clear");
+
+        let before = c.calls.get();
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        assert_eq!(c.calls.get() - before, 1, "only the cleared sibling is redone");
+    }
+
+    #[test]
+    fn hash_line_edit_keeps_order_comments_and_line_endings() {
+        let src = "+++\r\ntitle = \"Inicio\"\r\n# hand-written, keep me\r\n[extra]\r\nnoindex = false\r\n[extra.hero]\r\ncta = \"Empieza\"\r\n+++\r\nbody\r\n";
+        let set = rewrite_hash_line(src, Some("abc")).unwrap();
+        assert!(set.contains("[extra]\r\nsource_hash = \"abc\"\r\nnoindex = false"), "{set}");
+        assert!(set.contains("# hand-written, keep me\r\n"));
+        let fm = front_matter_of(&set).unwrap();
+        assert_eq!(fm["extra"]["source_hash"].as_str(), Some("abc"));
+        assert_eq!(fm["extra"]["hero"]["cta"].as_str(), Some("Empieza"));
+
+        let again = rewrite_hash_line(&set, Some("def")).unwrap();
+        assert_eq!(again, set.replace("abc", "def"), "an existing stamp is replaced in place");
+        assert_eq!(rewrite_hash_line(&set, None).unwrap(), src, "removal restores the file");
+
+        // no [extra] header: a new table at the end of the front matter
+        let bare = "+++\ntitle = \"T\"\n[extra.hero]\ncta = \"x\"\n+++\nbody\n";
+        let fm = front_matter_of(&rewrite_hash_line(bare, Some("h")).unwrap()).unwrap();
+        assert_eq!(fm["extra"]["source_hash"].as_str(), Some("h"));
+        assert_eq!(fm["extra"]["hero"]["cta"].as_str(), Some("x"));
+        // a source_hash key in another table is not the stamp
+        let other = "+++\n[extra.hero]\nsource_hash = \"keep\"\n+++\n";
+        let fm = front_matter_of(&rewrite_hash_line(other, Some("h")).unwrap()).unwrap();
+        assert_eq!(fm["extra"]["hero"]["source_hash"].as_str(), Some("keep"));
+        assert_eq!(fm["extra"]["source_hash"].as_str(), Some("h"));
+    }
+
+    #[test]
+    fn extra_reply_must_match_the_source_shape() {
+        let src = vec![("a".to_string(), "One".to_string()), ("b".to_string(), "Two".to_string())];
+        let ok = parse_extra_reply(&json!(["Uno", "Dos"]), &src).unwrap();
+        assert_eq!(ok, vec![("a".into(), "Uno".into()), ("b".into(), "Dos".into())]);
+        assert!(parse_extra_reply(&json!(["Uno"]), &src).is_err(), "short array");
+        assert!(parse_extra_reply(&json!(null), &src).is_err(), "missing array");
+        assert!(parse_extra_reply(&json!(["Uno", 2]), &src).is_err(), "non-string item");
+        assert!(parse_extra_reply(&json!(null), &[]).unwrap().is_empty());
     }
 }
