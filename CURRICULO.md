@@ -10,6 +10,7 @@ behavior is unchanged; we add three subcommands used by `curriculo-tech/landing-
 | `v0.23.2-curriculo.2` | `zola graph migrate` / `graph refresh` |
 | `v0.23.2-curriculo.3` | Clean migrate extraction (metadata description, boilerplate strip, asset URL skip) |
 | `v0.23.2-curriculo.13` | `zola indexnow` — IndexNow ping for changed content |
+| `v0.23.2-curriculo.14` | `zola translate` translates `[extra]` copy and sections, rejects broken or untranslated output, `--adopt` |
 
 Landing CI pins the binary via `ZOLA_VERSION` / `ZOLA_BIN_URL` (never `latest`).
 
@@ -17,13 +18,44 @@ Landing CI pins the binary via `ZOLA_VERSION` / `ZOLA_BIN_URL` (never `latest`).
 
 ### `zola translate`
 
-Generate/refresh co-located `index.<lang>.md` siblings via OpenRouter
-(`openai/gpt-4o-mini`). Hash-gated on `extra.source_hash`. Needs
-`OPENROUTER_API_KEY`.
+Generate/refresh co-located `index.<lang>.md` and `_index.<lang>.md` siblings
+via OpenRouter (`openai/gpt-4o-mini`), or the endpoint at `TRANSLATE_URL`.
+Hash-gated on `extra.source_hash`. Needs `OPENROUTER_API_KEY` unless
+`TRANSLATE_URL` is set.
 
 ```bash
 zola --root <site> translate [--max N] [--dry-run]
+zola --root <site> translate --adopt      # stamp good hand translations fresh, no API
 ```
+
+- **What is translated:** `title`, `description`, the body, and every copy-like
+  string in `[extra]` (nested tables and arrays included). Ids, routes, hashes
+  and machine data are never sent: keys such as `canonical`, `source_url`,
+  `jsonld`, `icon`, `id`, `slug`, `date`, `author`, any `*_url`/`*_id`/`*_hash`,
+  and values that are URLs, paths, slugs or embedded JSON.
+- **Sections:** `_index.md` is translated like a page. A file with neither a
+  body nor `[extra]` copy (a title-only stub) is skipped.
+- **Freshness:** `source_hash` covers title, description, body and `[extra]`
+  copy. A page without `[extra]` copy hashes exactly as before, so upgrading
+  does not re-translate it. Pages that have `[extra]` copy get a new hash and
+  are re-translated once (or stamped with `--adopt`); so does every page whose
+  copy selection changes when the skip lists or the glossary change.
+- **Writes:** the sibling follows the English front matter with the
+  translated strings at their paths. Top-level `[extra]` keys only the sibling
+  has (`noindex`, say) are kept.
+- **Never written:** output that loses a brand token, changes the HTML tags or
+  adds a bare `<` (the cause of footers rendering inside `<main>`), or, on the
+  OpenRouter path, returns prose unchanged (two or more lowercase words, or
+  five or more words in all; brand tokens, acronyms and names do not count).
+  Empty output for a non-empty field, and a changed count of code fences,
+  `{{`/`{%` shortcodes or `](` link targets, are rejected too.
+- **`--recheck`:** runs the same checks on siblings already stamped fresh and
+  removes the stamp from those that fail, so the next run redoes them. Exits
+  non-zero when it cleared anything.
+- **Any language:** a code outside the built-in names is passed to the model
+  as-is, so adding `[languages.<code>]` to config.toml is enough.
+- **`--adopt`:** marks an existing sibling fresh only when it has every
+  `[extra]` copy path and passes the same checks. Copy is never changed.
 
 ### `zola graph`
 
