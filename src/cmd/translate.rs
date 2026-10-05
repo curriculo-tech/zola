@@ -2064,7 +2064,58 @@ mod tests {
             });
             TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
         }
+
+        /// Echo `texts` back as `translations`. Packed `XHTML0003X` tokens
+        /// survive; the client must unpack them. Optional `strip_real_tags`
+        /// mimics raw NLLB dropping `<p>` / `<table>` — after pack there are
+        /// none, so unpack still restores structure.
+        fn echo(strip_real_tags: bool) -> Self {
+            use std::io::Write;
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let reqs = Arc::new(AtomicUsize::new(0));
+            let (c2, r2) = (conns.clone(), reqs.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    while let Some(body) = read_request_body(&mut stream) {
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        let texts: Vec<String> = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v["texts"].as_array().cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .map(|t| {
+                                if strip_real_tags {
+                                    TAG_STRIP.replace_all(&t, "").into_owned()
+                                } else {
+                                    t
+                                }
+                            })
+                            .collect();
+                        let out = json!({ "ok": true, "translations": texts }).to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                            out.len(),
+                            out
+                        );
+                        if stream.write_all(resp.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
+        }
     }
+
+    static TAG_STRIP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?>").unwrap()
+    });
 
     /// Read one request (headers + Content-Length body) off the stream; None on EOF.
     fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
@@ -2867,6 +2918,41 @@ mod tests {
         let restored = unpack_html_tags(&stripped, &tags);
         assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
         assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    }
+
+    #[test]
+    fn translate_api_client_restores_html_when_endpoint_echoes_packed_tokens() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page(
+            "content/post/index.md",
+            "title = \"Hire with Curriculo ATS\"\ndescription = \"Ready to hire with precision?\"\n",
+            "<p>See the <a href=\"/ai-resume-builder/\">AI resume builder</a>.</p>\n<table><tr><td>Plan</td><td>Price</td></tr></table>\n",
+        );
+        let server = TinyServer::echo(true);
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
+        let es = fx.page_body("content/post/index.es.md");
+        assert!(es.contains("<p>"), "{es}");
+        assert!(es.contains("</p>"), "{es}");
+        assert!(es.contains("<table>"), "{es}");
+        assert!(es.contains("</table>"), "{es}");
+        assert!(es.contains("<a href=\"/ai-resume-builder/\">"), "{es}");
+        assert!(!es.contains("XHTML"), "tokens must be unpacked: {es}");
+        assert!(server.reqs.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn translate_api_client_plain_extra_has_no_pack_tokens() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        let server = TinyServer::echo(false);
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
+        let es = fx.page_body("content/_index.es.md");
+        assert!(!es.contains("XHTML"), "{es}");
+        assert!(es.contains("Start Free") || es.contains("Case studies"), "{es}");
     }
 
     /// Mock that loses a closing tag.
