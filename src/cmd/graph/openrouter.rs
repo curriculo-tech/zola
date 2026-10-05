@@ -14,6 +14,25 @@ const MAX_TOKENS: u32 = 4096;
 /// Body chars sent to the model — caps tokens per page.
 const BODY_CHAR_CAP: usize = 6000;
 
+/// Chat-completions endpoint: `OPENROUTER_URL` env override (any OpenAI-compatible
+/// gateway, e.g. the product's litellm), empty/unset → OpenRouter itself. Same
+/// pattern as translate's `TRANSLATE_URL`.
+fn endpoint_from(env_val: Option<&str>) -> &str {
+    match env_val.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => OPENROUTER_URL,
+    }
+}
+
+/// Model id: `OPENROUTER_MODEL` env override (a gateway's roster may name it
+/// differently), empty/unset → ADR-003's gpt-4o-mini.
+fn model_from(env_val: Option<&str>) -> &str {
+    match env_val.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => MODEL,
+    }
+}
+
 /// Page fields the model sees.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicInput {
@@ -74,7 +93,7 @@ impl TopicClient for OpenRouterTopicClient {
     fn extract(&self, input: &TopicInput, key: &str) -> Result<TopicExtract> {
         let body = truncate(&input.body, BODY_CHAR_CAP);
         let payload = json!({
-            "model": MODEL,
+            "model": model_from(std::env::var("OPENROUTER_MODEL").ok().as_deref()),
             "response_format": {"type": "json_object"},
             "max_tokens": MAX_TOKENS,
             "messages": [
@@ -105,9 +124,10 @@ impl TopicClient for OpenRouterTopicClient {
         site: &super::site::GraphSiteConfig,
     ) -> Result<String> {
         let body = truncate(body, 4000);
-        let instruction = site.overview_instruction.as_deref().unwrap_or(
-            "Describe this page for an AI citation. Do not invent metrics.",
-        );
+        let instruction = site
+            .overview_instruction
+            .as_deref()
+            .unwrap_or("Describe this page for an AI citation. Do not invent metrics.");
         let site_title = if site.title.is_empty() { "this site" } else { site.title.as_str() };
         let user = format!(
             "Write 134 to 167 words, inclusive, plain prose, no heading, no bullets.\n\
@@ -119,7 +139,7 @@ impl TopicClient for OpenRouterTopicClient {
             site_blurb = site.description,
         );
         let payload = json!({
-            "model": MODEL,
+            "model": model_from(std::env::var("OPENROUTER_MODEL").ok().as_deref()),
             "max_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "user", "content": user},
@@ -135,7 +155,7 @@ fn chat_content(key: &str, payload: Value) -> Result<String> {
     let resp = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?
-        .post(OPENROUTER_URL)
+        .post(endpoint_from(std::env::var("OPENROUTER_URL").ok().as_deref()))
         .bearer_auth(key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(bytes)
@@ -229,6 +249,19 @@ mod tests {
         assert_eq!(ex.topics[0].aliases, vec!["recruiting".to_string()]);
         assert_eq!(ex.relations.len(), 1);
         assert_eq!(ex.relations[0].kind, "related");
+    }
+
+    #[test]
+    fn endpoint_and_model_overrides() {
+        assert_eq!(endpoint_from(None), super::OPENROUTER_URL);
+        assert_eq!(endpoint_from(Some("")), super::OPENROUTER_URL);
+        assert_eq!(endpoint_from(Some("  ")), super::OPENROUTER_URL);
+        assert_eq!(
+            endpoint_from(Some("http://127.0.0.1:4001/v1/chat/completions")),
+            "http://127.0.0.1:4001/v1/chat/completions"
+        );
+        assert_eq!(model_from(None), super::MODEL);
+        assert_eq!(model_from(Some("gpt-4o-mini")), "gpt-4o-mini");
     }
 
     #[test]
