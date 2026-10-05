@@ -252,7 +252,14 @@ impl BatchTranslateClient for TranslateApiClient {
         if texts.is_empty() {
             return Ok(Vec::new()); // the driver never packs an empty batch
         }
-        let payload = build_batch_request(texts, lang, &self.preserve_terms);
+        // NLLB drops wrapping `<p>` and whole `<table>` trees. Pack tags as
+        // fixed-width tokens the model copies. OpenRouter does not pack —
+        // its prompt already says keep tags. Distinct from curriculo-ai
+        // glossary `⟦N⟧` (two maskers on that token collided).
+        let packed: Vec<(String, Vec<String>)> =
+            texts.iter().copied().map(pack_html_tags).collect();
+        let packed_refs: Vec<&str> = packed.iter().map(|(s, _)| s.as_str()).collect();
+        let payload = build_batch_request(&packed_refs, lang, &self.preserve_terms);
         let resp = self
             .client
             .post(&self.url)
@@ -264,8 +271,74 @@ impl BatchTranslateClient for TranslateApiClient {
         if !status.is_success() {
             bail!("translate endpoint HTTP {status}: {}", take200(&text));
         }
-        parse_batch_translate_response(&text, texts.len())
+        let mut out = parse_batch_translate_response(&text, texts.len())?;
+        for ((_, tags), (translation, _)) in packed.iter().zip(out.iter_mut()) {
+            *translation = unpack_html_tags(translation, tags);
+        }
+        Ok(out)
     }
+}
+
+/// `XHTML0003X` — 4-digit index so `XHTML0001X` is not a prefix of `XHTML0010X`.
+fn html_pack_token(index: usize) -> String {
+    format!("XHTML{index:04}X")
+}
+
+/// Replace each HTML tag with ` XHTML0003X `. Leaves bare `<` (`<20 min`)
+/// and `<!` comments alone — same rule as [`tag_counts`].
+fn pack_html_tags(text: &str) -> (String, Vec<String>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut tags = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                if let Some(rel) = text[i + 1..].find('>') {
+                    let end = i + 1 + rel + 1;
+                    tags.push(text[i..end].to_string());
+                    out.push(' ');
+                    out.push_str(&html_pack_token(tags.len() - 1));
+                    out.push(' ');
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, tags)
+}
+
+fn unpack_html_tags(text: &str, tags: &[String]) -> String {
+    let mut out = text.to_string();
+    for (i, tag) in tags.iter().enumerate().rev() {
+        let needle = html_pack_token(i);
+        if let Some(range) = find_ascii_ignore_case(&out, &needle) {
+            out.replace_range(range, tag);
+        }
+    }
+    out
+}
+
+fn find_ascii_ignore_case(hay: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    for i in 0..=h.len() - n.len() {
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return Some(i..i + n.len());
+        }
+    }
+    None
 }
 
 /// Build one bulk request body. `preserve_terms` is included only when
@@ -2748,6 +2821,52 @@ mod tests {
         // a bare `<` already in the source may stay
         let src_lt = t("T", "", "Setup in <20 min.");
         assert!(markup_ok(&src_lt, &t("T", "", "Listo en <20 min.")).is_ok());
+    }
+
+    #[test]
+    fn pack_html_tags_round_trips_and_skips_bare_lt() {
+        let src = "<p>Hire faster with <strong>Curriculo ATS</strong>.</p> Setup in <20 min.";
+        let (packed, tags) = pack_html_tags(src);
+        assert_eq!(tags, vec!["<p>", "<strong>", "</strong>", "</p>"]);
+        assert!(packed.contains("XHTML0000X"));
+        assert!(packed.contains("XHTML0003X"));
+        assert!(!packed.contains("<p>"));
+        assert!(packed.contains("<20 min"));
+        let restored = unpack_html_tags(&packed, &tags);
+        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
+        assert!(restored.contains("<20 min"));
+        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    }
+
+    #[test]
+    fn unpack_html_tags_does_not_eat_index_ten_when_restoring_one() {
+        // 12 tags: unpadded XHTML1X is a prefix of XHTML10X.
+        let src = (0..12).map(|i| format!("<td>{i}</td>")).collect::<String>();
+        let (packed, tags) = pack_html_tags(&src);
+        assert!(packed.contains("XHTML0001X"));
+        assert!(packed.contains("XHTML0010X"));
+        assert!(packed.contains("XHTML0011X"));
+        let restored = unpack_html_tags(&packed, &tags);
+        assert_eq!(tag_counts(&src).tags, tag_counts(&restored).tags);
+        assert_eq!(tags.len(), 24, "open+close per cell");
+        let lower = packed.replace("XHTML0010X", "xhtml0010x");
+        assert_eq!(
+            tag_counts(&src).tags,
+            tag_counts(&unpack_html_tags(&lower, &tags)).tags
+        );
+    }
+
+    #[test]
+    fn unpack_html_tags_survives_nllb_dropping_real_tags() {
+        // What raw NLLB does to a table: eat the tags, keep inner words.
+        // Packed form has no real tags, so a tag-dropping model still
+        // round-trips structure after unpack.
+        let src = "<table><tr><td>Plan</td><td>Price</td></tr></table>";
+        let (packed, tags) = pack_html_tags(src);
+        let stripped = packed.replace('<', "").replace('>', "");
+        let restored = unpack_html_tags(&stripped, &tags);
+        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
+        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
     }
 
     /// Mock that loses a closing tag.
