@@ -10,11 +10,8 @@ behavior is unchanged; we add three subcommands used by `curriculo-tech/landing-
 | `v0.23.2-curriculo.2` | `zola graph migrate` / `graph refresh` |
 | `v0.23.2-curriculo.3` | Clean migrate extraction (metadata description, boilerplate strip, asset URL skip) |
 | `v0.23.2-curriculo.13` | `zola indexnow` — IndexNow ping for changed content |
-<<<<<<< HEAD
-| `v0.23.2-curriculo.14` | `zola translate` translates `[extra]` copy and sections, rejects broken or untranslated output, `--adopt` |
-=======
 | `v0.23.2-curriculo.14` | graph: `OPENROUTER_URL` / `OPENROUTER_MODEL` env overrides (OpenAI-compatible gateway) |
->>>>>>> origin/master
+| `v0.23.2-curriculo.15` | `zola translate` translates `[extra]` copy and sections, rejects broken or untranslated output, `--adopt` / `--recheck` |
 
 Landing CI pins the binary via `ZOLA_VERSION` / `ZOLA_BIN_URL` (never `latest`).
 
