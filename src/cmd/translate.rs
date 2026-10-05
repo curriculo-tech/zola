@@ -252,7 +252,14 @@ impl BatchTranslateClient for TranslateApiClient {
         if texts.is_empty() {
             return Ok(Vec::new()); // the driver never packs an empty batch
         }
-        let payload = build_batch_request(texts, lang, &self.preserve_terms);
+        // NLLB drops wrapping `<p>` and whole `<table>` trees. Pack tags as
+        // fixed-width tokens the model copies. OpenRouter does not pack —
+        // its prompt already says keep tags. Distinct from curriculo-ai
+        // glossary `⟦N⟧` (two maskers on that token collided).
+        let packed: Vec<(String, Vec<HtmlTag>)> =
+            texts.iter().copied().map(pack_html_tags).collect();
+        let packed_refs: Vec<&str> = packed.iter().map(|(s, _)| s.as_str()).collect();
+        let payload = build_batch_request(&packed_refs, lang, &self.preserve_terms);
         let resp = self
             .client
             .post(&self.url)
@@ -264,8 +271,134 @@ impl BatchTranslateClient for TranslateApiClient {
         if !status.is_success() {
             bail!("translate endpoint HTTP {status}: {}", take200(&text));
         }
-        parse_batch_translate_response(&text, texts.len())
+        let mut out = parse_batch_translate_response(&text, texts.len())?;
+        for (i, ((_, tags), (translation, ok))) in packed.iter().zip(out.iter_mut()).enumerate() {
+            if !*ok {
+                continue;
+            }
+            match unpack_html_tags(translation, tags) {
+                Ok(restored) => *translation = restored,
+                Err(e) => {
+                    // Soft-fail this string: driver skips the page, OpenRouter
+                    // retry can pick it up. Never write leftover XHTML tokens.
+                    log::error!("translate: HTML pack restore failed: {e}");
+                    *translation = texts[i].to_string();
+                    *ok = false;
+                }
+            }
+        }
+        Ok(out)
     }
+}
+
+/// `XHTML0003X` — 4-digit index so `XHTML0001X` is not a prefix of `XHTML0010X`.
+fn html_pack_token(index: usize) -> String {
+    format!("XHTML{index:04}X")
+}
+
+fn html_pack_token_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)XHTML(\d{4})X").unwrap())
+}
+
+struct HtmlTag {
+    tag: String,
+    /// Whitespace immediately before/after the tag in the source. Restored
+    /// verbatim so packing's extra spaces around the token do not leak
+    /// (`</strong> .` / CJK `用 <strong>`).
+    ws_before: String,
+    ws_after: String,
+}
+
+/// Replace each HTML tag with a padded ` XHTML0003X ` token. Leaves bare
+/// `<` (`<20 min`) and `<!` comments alone — same rule as [`tag_counts`].
+/// Surrounding spaces are recorded so unpack can restore the original
+/// adjacency (no extra space before `.`, none inside CJK).
+fn pack_html_tags(text: &str) -> (String, Vec<HtmlTag>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut tags = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                if let Some(rel) = text[i + 1..].find('>') {
+                    let end = i + 1 + rel + 1;
+                    let ws_before = {
+                        let n = text[..i]
+                            .chars()
+                            .rev()
+                            .take_while(|c| c.is_whitespace())
+                            .collect::<String>();
+                        n.chars().rev().collect()
+                    };
+                    let ws_after: String = text[end..].chars().take_while(|c| c.is_whitespace()).collect();
+                    tags.push(HtmlTag {
+                        tag: text[i..end].to_string(),
+                        ws_before,
+                        ws_after,
+                    });
+                    out.push(' ');
+                    out.push_str(&html_pack_token(tags.len() - 1));
+                    out.push(' ');
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, tags)
+}
+
+fn placeholder_hits(text: &str) -> Vec<(usize, usize, usize)> {
+    html_pack_token_re()
+        .captures_iter(text)
+        .filter_map(|c| {
+            let m = c.get(0)?;
+            let idx: usize = c.get(1)?.as_str().parse().ok()?;
+            Some((m.start(), m.end(), idx))
+        })
+        .collect()
+}
+
+/// Restore tags. Fails (caller marks ok=false) when:
+/// - placeholders are missing, repeated, or out of original order
+///   (ja/ko/ar can swap `<strong>` / `</strong>` and still match tag counts)
+/// - any `XHTML####X` token remains after restore (engine echoed a spare)
+fn unpack_html_tags(text: &str, tags: &[HtmlTag]) -> Result<String> {
+    let hits = placeholder_hits(text);
+    let expected: Vec<usize> = (0..tags.len()).collect();
+    let got: Vec<usize> = hits.iter().map(|h| h.2).collect();
+    if got != expected {
+        bail!(
+            "HTML placeholders missing, repeated, or reordered (expected {expected:?}, got {got:?})"
+        );
+    }
+    let mut out = text.to_string();
+    for (start, end, idx) in hits.into_iter().rev() {
+        let tag = &tags[idx];
+        let mut lo = start;
+        let mut hi = end;
+        while lo > 0 && out.as_bytes()[lo - 1].is_ascii_whitespace() {
+            lo -= 1;
+        }
+        while hi < out.len() && out.as_bytes()[hi].is_ascii_whitespace() {
+            hi += 1;
+        }
+        let put = format!("{}{}{}", tag.ws_before, tag.tag, tag.ws_after);
+        out.replace_range(lo..hi, &put);
+    }
+    if !placeholder_hits(&out).is_empty() {
+        bail!("HTML placeholder left after restore");
+    }
+    Ok(out)
 }
 
 /// Build one bulk request body. `preserve_terms` is included only when
@@ -2014,7 +2147,95 @@ mod tests {
             });
             TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
         }
+
+        /// Echo `texts` back as `translations`. Packed `XHTML0003X` tokens
+        /// survive; the client must unpack them. Optional `strip_real_tags`
+        /// mimics raw NLLB dropping `<p>` / `<table>` — after pack there are
+        /// none, so unpack still restores structure.
+        fn echo(strip_real_tags: bool) -> Self {
+            use std::io::Write;
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let reqs = Arc::new(AtomicUsize::new(0));
+            let (c2, r2) = (conns.clone(), reqs.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    while let Some(body) = read_request_body(&mut stream) {
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        let texts: Vec<String> = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v["texts"].as_array().cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .map(|t| {
+                                if strip_real_tags {
+                                    TAG_STRIP.replace_all(&t, "").into_owned()
+                                } else {
+                                    t
+                                }
+                            })
+                            .collect();
+                        let out = json!({ "ok": true, "translations": texts }).to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                            out.len(),
+                            out
+                        );
+                        if stream.write_all(resp.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
+        }
+
+        fn echo_map(map: fn(&str) -> String) -> Self {
+            use std::io::Write;
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let reqs = Arc::new(AtomicUsize::new(0));
+            let (c2, r2) = (conns.clone(), reqs.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    while let Some(body) = read_request_body(&mut stream) {
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        let texts: Vec<String> = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v["texts"].as_array().cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .map(|t| map(&t))
+                            .collect();
+                        let out = json!({ "ok": true, "translations": texts }).to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                            out.len(),
+                            out
+                        );
+                        if stream.write_all(resp.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
+        }
     }
+
+    static TAG_STRIP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?>").unwrap()
+    });
 
     /// Read one request (headers + Content-Length body) off the stream; None on EOF.
     fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
@@ -2771,6 +2992,139 @@ mod tests {
         // a bare `<` already in the source may stay
         let src_lt = t("T", "", "Setup in <20 min.");
         assert!(markup_ok(&src_lt, &t("T", "", "Listo en <20 min.")).is_ok());
+    }
+
+    #[test]
+    fn pack_html_tags_round_trips_and_skips_bare_lt() {
+        let src = "<p>Hire faster with <strong>Curriculo ATS</strong>.</p> Setup in <20 min.";
+        let (packed, tags) = pack_html_tags(src);
+        let names: Vec<&str> = tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(names, vec!["<p>", "<strong>", "</strong>", "</p>"]);
+        assert!(packed.contains("XHTML0000X"));
+        assert!(packed.contains("XHTML0003X"));
+        assert!(!packed.contains("<p>"));
+        assert!(packed.contains("<20 min"));
+        let restored = unpack_html_tags(&packed, &tags).unwrap();
+        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
+        assert!(restored.contains("<20 min"));
+        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    }
+
+    #[test]
+    fn unpack_html_tags_does_not_eat_index_ten_when_restoring_one() {
+        // 12 tags: unpadded XHTML1X is a prefix of XHTML10X.
+        let src = (0..12).map(|i| format!("<td>{i}</td>")).collect::<String>();
+        let (packed, tags) = pack_html_tags(&src);
+        assert!(packed.contains("XHTML0001X"));
+        assert!(packed.contains("XHTML0010X"));
+        assert!(packed.contains("XHTML0011X"));
+        let restored = unpack_html_tags(&packed, &tags).unwrap();
+        assert_eq!(tag_counts(&src).tags, tag_counts(&restored).tags);
+        assert_eq!(tags.len(), 24, "open+close per cell");
+        let lower = packed.replace("XHTML0010X", "xhtml0010x");
+        assert_eq!(
+            tag_counts(&src).tags,
+            tag_counts(&unpack_html_tags(&lower, &tags).unwrap()).tags
+        );
+    }
+
+    #[test]
+    fn unpack_html_tags_survives_nllb_dropping_real_tags() {
+        // What raw NLLB does to a table: eat the tags, keep inner words.
+        // Packed form has no real tags, so a tag-dropping model still
+        // round-trips structure after unpack.
+        let src = "<table><tr><td>Plan</td><td>Price</td></tr></table>";
+        let (packed, tags) = pack_html_tags(src);
+        let stripped = packed.replace('<', "").replace('>', "");
+        let restored = unpack_html_tags(&stripped, &tags).unwrap();
+        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
+        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    }
+
+    #[test]
+    fn unpack_rejects_leftover_placeholder() {
+        let src = "<p>Ready to hire?</p>";
+        let (packed, tags) = pack_html_tags(src);
+        let dup = format!("{packed} XHTML0001X");
+        let err = unpack_html_tags(&dup, &tags).unwrap_err().to_string();
+        assert!(err.contains("reordered") || err.contains("repeated") || err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn unpack_rejects_reordered_placeholders() {
+        // ja/ko/ar can swap open/close while keeping counts.
+        let src = "Click <strong>here</strong>";
+        let (packed, tags) = pack_html_tags(src);
+        let swapped = packed.replace("XHTML0000X", "TMP").replace("XHTML0001X", "XHTML0000X").replace("TMP", "XHTML0001X");
+        let err = unpack_html_tags(&swapped, &tags).unwrap_err().to_string();
+        assert!(err.contains("reordered") || err.contains("got"), "{err}");
+    }
+
+    #[test]
+    fn unpack_restores_original_spacing() {
+        let src = "Hire faster with <strong>Curriculo ATS</strong>.";
+        let (packed, tags) = pack_html_tags(src);
+        let restored = unpack_html_tags(&packed, &tags).unwrap();
+        assert_eq!(restored, src, "no space before the full stop");
+        let cjk = "用<strong>Curriculo ATS</strong>更快";
+        let (p2, t2) = pack_html_tags(cjk);
+        assert_eq!(unpack_html_tags(&p2, &t2).unwrap(), cjk);
+    }
+
+    #[test]
+    fn translate_api_client_restores_html_when_endpoint_echoes_packed_tokens() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page(
+            "content/post/index.md",
+            "title = \"Hire with Curriculo ATS\"\ndescription = \"Ready to hire with precision?\"\n",
+            "<p>See the <a href=\"/ai-resume-builder/\">AI resume builder</a>.</p>\n<table><tr><td>Plan</td><td>Price</td></tr></table>\n",
+        );
+        let server = TinyServer::echo(true);
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
+        let es = fx.page_body("content/post/index.es.md");
+        assert!(es.contains("<p>"), "{es}");
+        assert!(es.contains("</p>"), "{es}");
+        assert!(es.contains("<table>"), "{es}");
+        assert!(es.contains("</table>"), "{es}");
+        assert!(es.contains("<a href=\"/ai-resume-builder/\">"), "{es}");
+        assert!(!es.contains("XHTML"), "tokens must be unpacked: {es}");
+        assert!(server.reqs.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn translate_api_client_plain_extra_has_no_pack_tokens() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page("content/_index.md", extra_fm(), "\n");
+        let server = TinyServer::echo(false);
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
+        let es = fx.page_body("content/_index.es.md");
+        assert!(!es.contains("XHTML"), "{es}");
+        assert!(es.contains("Start Free") || es.contains("Case studies"), "{es}");
+    }
+
+    #[test]
+    fn translate_api_client_rejects_leftover_placeholder_and_writes_nothing() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        fx.write_page(
+            "content/post/index.md",
+            "title = \"T\"\ndescription = \"D\"\n",
+            "<p>Ready to hire?</p>\n",
+        );
+        let server = TinyServer::echo_map(|t| format!("{t} XHTML0001X"));
+        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
+        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &client);
+        assert!(res.is_err(), "leftover placeholder must fail the page");
+        assert!(!fx.root().join("content/post/index.es.md").exists());
+        let es = fx.root().join("content/post/index.es.md");
+        if es.exists() {
+            let body = fs::read_to_string(&es).unwrap();
+            assert!(!body.contains("XHTML"), "must not publish leftover tokens: {body}");
+        }
     }
 
     /// Mock that loses a closing tag.

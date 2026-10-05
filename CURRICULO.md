@@ -44,6 +44,15 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
 - **Writes:** the sibling follows the English front matter with the
   translated strings at their paths. Top-level `[extra]` keys only the sibling
   has (`noindex`, say) are kept.
+- **TRANSLATE_URL HTML pack:** the endpoint client replaces each HTML tag with a
+  fixed-width `XHTML0003X` token before the POST and restores it after. NLLB
+  otherwise drops wrapping `<p>` and whole `<table>` trees, which the markup
+  gate then rejects. Restore **fails the string** (page not written; OpenRouter
+  can retry) if a placeholder is missing, repeated, reordered, or left over —
+  tag *counts* matching is not enough (swapped `<strong>`/`</strong>` still
+  counts). Original whitespace next to each tag is restored, so packing spaces
+  do not leak. OpenRouter is not packed (the prompt already says keep tags).
+  Bare `<` (`<20 min`) is left alone.
 - **Never written:** output that loses a brand token, changes the HTML tags or
   adds a bare `<` (the cause of footers rendering inside `<main>`), or, on the
   OpenRouter path, returns prose unchanged (two or more lowercase words, or
