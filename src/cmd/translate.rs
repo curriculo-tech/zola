@@ -1637,14 +1637,22 @@ fn sibling_path(page: &Path, lang: &str) -> PathBuf {
 /// Write the sibling from the English front matter with the translated fields
 /// and `[extra]` copy set at their paths. Top-level `[extra]` keys the English
 /// page does not have (a locale's own `noindex`, say) are kept from the
-/// existing sibling; everything else follows the English layout.
+/// existing sibling; everything else follows the English layout. An explicit
+/// `path` gets the sibling's language prefix and `aliases` are dropped: both
+/// are URLs, and a copied one makes two pages claim it and fails the build.
 fn write_sibling(path: &Path, en_fm: &toml::Value, t: &Translatable, hash: &str) -> Result<()> {
     let existing_extra = parse_page(path)
         .ok()
         .and_then(|(fm, _)| fm.get("extra").and_then(|e| e.as_table().cloned()))
         .unwrap_or_default();
+    let lang = sibling_lang(path)?;
     let mut fm = en_fm.clone();
     if let Some(table) = fm.as_table_mut() {
+        table.remove("aliases");
+        if let Some(en_path) = table.get("path").and_then(|p| p.as_str()) {
+            let localized = localized_path(en_path, &lang);
+            table.insert("path".into(), toml::Value::String(localized));
+        }
         if !t.title.is_empty() || table.contains_key("title") {
             table.insert("title".into(), toml::Value::String(t.title.clone()));
         }
@@ -1671,6 +1679,21 @@ fn write_sibling(path: &Path, en_fm: &toml::Value, t: &Translatable, hash: &str)
     }
     fs::write(path, format!("+++\n{fm_str}+++\n\n{}\n", t.body.trim_end()))?;
     Ok(())
+}
+
+/// `fr` from `<dir>/index.fr.md`.
+fn sibling_lang(path: &Path) -> Result<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once('.'))
+        .map(|(_, lang)| lang.to_string())
+        .ok_or_else(|| anyhow!("{}: not a `<stem>.<lang>.md` sibling", path.display()))
+}
+
+/// `engineering/post` → `fr/engineering/post`, keeping a leading `/`.
+fn localized_path(en_path: &str, lang: &str) -> String {
+    let rest = en_path.trim_start_matches('/');
+    if en_path.starts_with('/') { format!("/{lang}/{rest}") } else { format!("{lang}/{rest}") }
 }
 
 fn take200(s: &str) -> String {
@@ -2959,6 +2982,33 @@ mod tests {
         let fm = front_matter_of(&rewrite_hash_line(other, Some("h")).unwrap()).unwrap();
         assert_eq!(fm["extra"]["hero"]["source_hash"].as_str(), Some("keep"));
         assert_eq!(fm["extra"]["source_hash"].as_str(), Some("h"));
+    }
+
+    #[test]
+    fn sibling_path_is_prefixed_with_its_language_and_aliases_are_dropped() {
+        let fx = Fixture::new();
+        fx.write_page(
+            "content/eng-post/index.md",
+            "title = \"Post Curriculo\"\npath = \"engineering/post\"\naliases = [\"/old-post/\"]\n",
+            "Body Curriculo.\n",
+        );
+        fx.write_page(
+            "content/eng-root/index.md",
+            "title = \"Root Curriculo\"\npath = \"/engineering/root/\"\n",
+            "Body Curriculo.\n",
+        );
+        let c = EchoClient { calls: Cell::new(0) };
+        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+
+        let es = fm_of(&fx, "content/eng-post/index.es.md");
+        assert_eq!(
+            es["path"].as_str(),
+            Some("es/engineering/post"),
+            "two pages may not share a URL"
+        );
+        assert!(es.get("aliases").is_none(), "an alias is an English URL, it would collide");
+        let fr = fm_of(&fx, "content/eng-root/index.fr.md");
+        assert_eq!(fr["path"].as_str(), Some("/fr/engineering/root/"));
     }
 
     #[test]
