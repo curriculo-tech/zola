@@ -140,6 +140,16 @@ pub enum Command {
         /// Report stale/missing siblings without calling the API (no key needed)
         #[clap(long)]
         dry_run: bool,
+
+        /// Stamp existing siblings that already hold a complete, checked
+        /// translation of the current source as fresh (no API, no key)
+        #[clap(long, conflicts_with_all = ["max", "dry_run", "recheck"])]
+        adopt: bool,
+
+        /// Clear the freshness stamp of siblings whose translation fails the
+        /// output checks, so the next run redoes them (no API, no key)
+        #[clap(long, conflicts_with_all = ["max", "dry_run"])]
+        recheck: bool,
     },
 
     /// Build/refresh the topical knowledge graph (migrate once via Firecrawl,

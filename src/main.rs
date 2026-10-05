@@ -206,10 +206,17 @@ fn main() {
             let cmd = &mut Cli::command();
             clap_complete::generate(shell, cmd, cmd.get_name().to_string(), &mut std::io::stdout());
         }
-        Command::Translate { max, dry_run } => {
+        Command::Translate { max, dry_run, adopt, recheck } => {
             log::info!("Translating...");
             let (root_dir, config_file) = get_config_file_path(&cli_dir, cli.config.as_deref());
-            if let Err(e) = cmd::translate(&root_dir, &config_file, max, dry_run) {
+            let res = if adopt {
+                cmd::translate_adopt(&root_dir, &config_file)
+            } else if recheck {
+                cmd::translate_recheck(&root_dir, &config_file)
+            } else {
+                cmd::translate(&root_dir, &config_file, max, dry_run)
+            };
+            if let Err(e) = res {
                 messages::unravel_errors("Failed to translate", &e);
                 std::process::exit(1);
             }
