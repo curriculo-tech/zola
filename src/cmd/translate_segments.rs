@@ -89,6 +89,13 @@ fn token_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)XHTML(\d{4})X").expect("token regex"))
 }
 
+/// A translation sits on one line of the page, with the whitespace around it
+/// already kept from the source: a model's stray newline would break a table
+/// row, a heading or a TOML title.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ").trim().to_string()
+}
+
 /// True when the text has a letter the model could translate.
 fn has_prose(text: &str) -> bool {
     text.chars().any(char::is_alphabetic)
@@ -199,7 +206,8 @@ impl Segment {
                 out.push_str(after);
             }
         }
-        if out.trim().is_empty() {
+        let out = one_line(&out);
+        if out.is_empty() {
             return Err("translation is empty".into());
         }
         Ok(out)
@@ -211,8 +219,10 @@ impl Segment {
         let mut out = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             let Item::Atom(atom) = item else { continue };
+            // Whitespace-only text between two constructs belongs to the left
+            // one's `after`; counting it as this one's `before` too would double it.
             let before = match i.checked_sub(1).and_then(|p| self.items.get(p)) {
-                Some(Item::Text(t)) => trail_ws(t).to_string(),
+                Some(Item::Text(t)) if has_prose(t) => trail_ws(t).to_string(),
                 _ => String::new(),
             };
             let after = match self.items.get(i + 1) {
@@ -244,7 +254,9 @@ impl Segment {
                 Item::Atom(a) => out.push_str(a),
                 Item::Text(t) if has_prose(t) => {
                     out.push_str(lead_ws(t));
-                    out.push_str(next.next().map_or(t.trim(), |s| s.trim()));
+                    out.push_str(
+                        &next.next().map_or_else(|| t.trim().to_string(), |s| one_line(s)),
+                    );
                     out.push_str(trail_ws(t));
                 }
                 Item::Text(t) => out.push_str(t),
@@ -296,6 +308,7 @@ where
                 _ => retry.push(i),
             },
             Some(Ok((_, false))) if !reads_as_prose(&seg.plain()) => {
+                log::warn!("translate: kept as written (reads as a name): {}", clip(&seg.source()));
                 out[i] = Some(Ok(seg.source()));
             }
             Some(Ok((_, false))) => retry.push(i),
@@ -352,8 +365,12 @@ fn join_fragments(seg: &Segment, sources: &[String], answers: &[Answer]) -> Resu
             {
                 texts.push(t.clone());
             }
-            // A name or a number reads the same in every language.
-            Ok(_) if !reads_as_prose(source) => texts.push(source.clone()),
+            // A name, a number or a loanword ("social media") reads the same in
+            // every language; longer prose that comes back unchanged is a failure.
+            Ok(_) if !reads_as_prose(source) || source.split_whitespace().count() <= 3 => {
+                log::warn!("translate: kept as written (reads as a name): {}", clip(source));
+                texts.push(source.clone());
+            }
             Ok(_) => return Err(format!("untranslated: {}", clip(source))),
             Err(e) => return Err(e.clone()),
         }
@@ -389,7 +406,11 @@ fn prefix_re() -> &'static Regex {
 
 fn refdef_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*\[[^\]]+\]:\s*\S+").expect("refdef regex"))
+    RE.get_or_init(|| {
+        // `[id]: url "optional title"`; not `[^1]: footnote text` or `[Note]: prose`.
+        Regex::new(r#"^\s*\[[^\]^]+\]:\s*(?:<[^>]*>|\S+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$"#)
+            .expect("refdef regex")
+    })
 }
 
 fn entity_re() -> &'static Regex {
@@ -405,7 +426,7 @@ fn attr_text_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:alt|title|placeholder|aria-label|aria-description)\s*=\s*(?:"([^"]*)"|'([^']*)')"#,
+            r#"(?i)\s(?:alt|title|placeholder|aria-label|aria-description)\s*=\s*(?:"([^"]*)"|'([^']*)')"#,
         )
         .expect("attr text regex")
     })
@@ -442,6 +463,9 @@ struct Splitter {
     pieces: Vec<Piece>,
     run: Vec<Item>,
     open: Open,
+    /// Line terminator of the previous line, not yet emitted: it joins the
+    /// next line into the same segment when both are lines of one paragraph.
+    pending_eol: String,
 }
 
 enum Angle {
@@ -464,18 +488,54 @@ enum Angle {
 
 impl Splitter {
     fn new() -> Self {
-        Self { pieces: Vec::new(), run: Vec::new(), open: Open::None }
+        Self { pieces: Vec::new(), run: Vec::new(), open: Open::None, pending_eol: String::new() }
     }
 
     fn run(mut self, text: &str) -> Vec<Piece> {
         for line in text.split_inclusive('\n') {
             let content = line.trim_end_matches(['\n', '\r']);
             let eol = &line[content.len()..];
+            self.continue_or_break(content);
             self.line(content);
-            self.keep(eol);
+            self.pending_eol = eol.to_string();
         }
         self.flush();
+        let eol = std::mem::take(&mut self.pending_eol);
+        self.push_keep(&eol);
         self.pieces
+    }
+
+    /// Emit the previous line's terminator: inside the segment when `next` is
+    /// a plain continuation of the paragraph being read, else as a boundary.
+    fn continue_or_break(&mut self, next: &str) {
+        let eol = std::mem::take(&mut self.pending_eol);
+        if eol.is_empty() {
+            return;
+        }
+        if self.continues_paragraph(next) {
+            self.text(&eol);
+        } else {
+            self.keep(&eol);
+        }
+    }
+
+    /// `next` continues the paragraph the open run is reading: no marker, no
+    /// indentation, no HTML, no table, fence or rule, and the run did not end
+    /// in a hard line break.
+    fn continues_paragraph(&self, next: &str) -> bool {
+        let ends_in_prose = match self.run.last() {
+            Some(Item::Text(t)) => has_prose(t) && !t.ends_with("  ") && !t.ends_with('\\'),
+            Some(Item::Atom(_)) => true,
+            None => false,
+        };
+        let plain_start =
+            next.chars().next().is_some_and(|c| !c.is_whitespace() && !"<|{".contains(c));
+        self.open == Open::None
+            && ends_in_prose
+            && plain_start
+            && prefix_re().find(next).is_none_or(|m| m.end() == 0)
+            && fence_of(next).is_none()
+            && !is_rule_or_refdef(next)
     }
 
     fn keep(&mut self, s: &str) {
@@ -582,7 +642,8 @@ impl Splitter {
                 }
             }
         }
-        if let Some((marker, len)) = fence_of(rest) {
+        let prefix_len = prefix_re().find(rest).map_or(0, |m| m.end());
+        if let Some((marker, len)) = fence_of(&rest[prefix_len..]) {
             self.keep(rest);
             self.open = Open::Fence(marker, len);
             return;
@@ -591,7 +652,6 @@ impl Splitter {
             self.keep(rest);
             return;
         }
-        let prefix_len = prefix_re().find(rest).map_or(0, |m| m.end());
         self.keep(&rest[..prefix_len]);
         let body = &rest[prefix_len..];
         let table = rest.trim_start().starts_with('|');
@@ -601,15 +661,22 @@ impl Splitter {
     /// Where the open multi-line construct ends within `line`, if it does.
     /// Resets `self.open` when it does.
     fn close_open(&mut self, line: &str) -> Option<usize> {
+        let mut next_quote = None;
         let end = match &self.open {
             Open::None => return Some(0),
             Open::Fence(marker, len) => {
-                let t = line.trim();
+                let t = line[prefix_re().find(line).map_or(0, |m| m.end())..].trim();
                 let closes = t.len() >= *len && t.chars().all(|c| c == *marker);
                 closes.then_some(line.len())
             }
             Open::Comment => line.find("-->").map(|i| i + 3),
-            Open::Tag(quote) => tag_end(line, *quote).ok(),
+            Open::Tag(quote) => match tag_end(line, *quote) {
+                Ok(end) => Some(end),
+                Err(still_open) => {
+                    next_quote = Some(still_open);
+                    None
+                }
+            },
             Open::Raw(name) => {
                 let lower = line.to_ascii_lowercase();
                 let needle = format!("</{name}");
@@ -619,6 +686,8 @@ impl Splitter {
         };
         if end.is_some() {
             self.open = Open::None;
+        } else if let Some(q) = next_quote {
+            self.open = Open::Tag(q);
         }
         end
     }
@@ -938,8 +1007,24 @@ fn angle(rest: &str) -> Angle {
             let end = after_name + end;
             Angle::Tag { end, name, closing, self_closing: rest[..end].ends_with("/>") }
         }
-        Err(quote) => Angle::OpenTag(quote),
+        Err(quote) if plausible_open_tag(&rest[after_name..]) => Angle::OpenTag(quote),
+        Err(_) => Angle::Text,
     }
+}
+
+/// Whether the text after a tag name that has no `>` on its line still reads as
+/// attributes (`href="x"`, `disabled`, an unterminated `class="a`). Prose such
+/// as `I said <b it's fine` does not, and must not swallow the page.
+fn plausible_open_tag(after_name: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(concat!(
+            r#"^(?:\s+[A-Za-z_:@][-\w:.@]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>=`]+))?)*"#,
+            r#"(?:\s+[A-Za-z_:@][-\w:.@]*\s*=\s*(?:"[^"]*|'[^']*))?\s*/?$"#,
+        ))
+        .expect("open tag regex")
+    });
+    re.is_match(after_name)
 }
 
 /// The byte after the `>` that closes a tag's attributes, honouring quotes
@@ -1021,7 +1106,6 @@ mod tests {
             let doc = Doc::split(&body);
             let same: Vec<String> = doc.segments().map(Segment::source).collect();
             assert_eq!(doc.render(&same), body, "lossy: {}", f.display());
-            let skeleton = doc.render(&vec![String::new(); doc.segments().count()]);
             let hostile: Vec<String> = doc
                 .segments()
                 .map(|s| s.restore_fragments(&vec!["X".to_string(); s.fragments().len()]))
@@ -1033,7 +1117,6 @@ mod tests {
                 "skeleton changed: {}",
                 f.display()
             );
-            let _ = skeleton;
             pages += 1;
             for s in doc.segments() {
                 segs += 1;
@@ -1188,6 +1271,97 @@ mod tests {
             "reordered"
         );
         assert!(seg.restore("a x y end").is_err(), "all dropped");
+    }
+
+    #[test]
+    fn whitespace_between_two_constructs_is_restored_once() {
+        for src in ["<b>a</b> <i>b</i> tail words here\n", "Read [one](/a) [two](/b) now please\n"]
+        {
+            let doc = Doc::split(src);
+            let seg = doc.segments().next().unwrap();
+            assert_eq!(seg.restore(&seg.packed()).unwrap(), seg.source().trim(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn footnotes_and_prose_in_brackets_are_translated_but_reference_links_are_kept() {
+        assert_eq!(texts("[^1]: This footnote text should be translated.\n").len(), 1);
+        assert_eq!(texts("[Update]: We launched a new feature today.\n").len(), 1);
+        assert!(texts("[docs]: https://example.com/docs \"The docs\"\n").is_empty());
+        assert!(texts("[id]: <https://example.com/a b>\n").is_empty());
+    }
+
+    #[test]
+    fn prose_with_a_stray_angle_bracket_does_not_swallow_the_page() {
+        let src =
+            "I said <b it's fine\nand this paragraph stays prose.\n\nAnother paragraph here.\n";
+        let all = texts(src);
+        assert!(all.iter().any(|t| t.contains("Another paragraph here")), "{all:?}");
+        assert!(all.iter().any(|t| t.contains("this paragraph stays prose")), "{all:?}");
+    }
+
+    #[test]
+    fn an_attribute_quote_stays_open_across_lines() {
+        let src = "<a href=\"x\"\n title=\"two\nlines>x\" class=\"c\">Real text here</a>\n";
+        assert_eq!(roundtrip(src), src);
+        let all = texts(src);
+        assert!(!all.iter().any(|t| t.contains("class=")), "attribute leaked into prose: {all:?}");
+    }
+
+    #[test]
+    fn a_fence_inside_a_list_item_or_quote_is_code() {
+        let src = "- ```sh\n  make all the things\n  ```\n\nAfter the list.\n";
+        assert_eq!(texts(src), vec!["After the list.".to_string()]);
+        let quoted = "> ```sh\n> make all the things\n> ```\n\nAfter the quote.\n";
+        assert_eq!(texts(quoted), vec!["After the quote.".to_string()]);
+    }
+
+    #[test]
+    fn a_hard_wrapped_paragraph_is_one_segment_but_blocks_are_not_joined() {
+        let wrapped = "This sentence wraps\nover three lines of\nsource text.\n";
+        assert_eq!(texts(wrapped).len(), 1);
+        assert_eq!(roundtrip(wrapped), wrapped);
+        for block in [
+            "A sentence.\n# Heading\n",
+            "A sentence.\n- item\n",
+            "A sentence.\n<div>x y z</div>\n",
+            "A sentence.\n| a | b |\n",
+            "A sentence.\n    indented continuation\n",
+            "Ends with a hard break  \nnext line\n",
+        ] {
+            assert!(texts(block).len() >= 2, "must stay separate: {block:?}");
+            assert_eq!(roundtrip(block), block);
+        }
+    }
+
+    #[test]
+    fn a_short_phrase_returned_unchanged_is_a_loanword_not_a_failure() {
+        let doc = Doc::split("social media\n\nThis longer sentence must really be translated.\n");
+        let segs: Vec<(usize, &Segment)> = doc.segments().map(|s| (0, s)).collect();
+        let mut send = |reqs: &[Request<'_>]| -> Vec<Answer> {
+            reqs.iter().map(|r| Ok((r.text.to_string(), true))).collect()
+        };
+        let results = translate_segments(&segs, &mut send);
+        assert_eq!(results[0], Ok("social media".to_string()));
+        assert!(results[1].is_err());
+    }
+
+    #[test]
+    fn restore_keeps_a_segment_on_one_line_and_trims_its_edges() {
+        let doc = Doc::split("Hello world today\n");
+        let seg = doc.segments().next().unwrap();
+        assert_eq!(seg.restore("  Hola mundo\nhoy \n").unwrap(), "Hola mundo hoy");
+        assert!(seg.restore(" \n ").is_err(), "blank is not a translation");
+    }
+
+    #[test]
+    fn restore_handles_more_than_ten_constructs_without_confusing_1_and_10() {
+        let src = (0..12).map(|i| format!("w{i} <b>x{i}</b>")).collect::<Vec<_>>().join(" and ");
+        let doc = Doc::split(&format!("{src} end\n"));
+        let seg = doc.segments().next().unwrap();
+        assert_eq!(seg.atom_count(), 24);
+        let echoed = seg.packed();
+        assert_eq!(seg.restore(&echoed).unwrap(), seg.source().trim());
     }
 
     #[test]

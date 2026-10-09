@@ -1,4 +1,5 @@
-//! `zola translate` — generate co-located translation siblings via OpenRouter.
+//! `zola translate` — generate co-located translation siblings via OpenRouter or a
+//! self-hosted batch endpoint.
 //!
 //! For each default-language page or section that has a body or `[extra]` copy,
 //! for each non-default language in config.toml: the sibling `<slug>.<lang>.md`
@@ -10,17 +11,23 @@
 //! (INV-5: a glossary token present in the source must survive verbatim, else
 //! the file is NOT written and counts as a failure).
 //!
+//! Page structure never reaches a model. Every translatable field is split by
+//! [`super::translate_segments`] into pieces copied from the source and short
+//! prose segments; only the segments are translated, and a segment whose inline
+//! markup does not round-trip is retried as plain fragments. A page is written
+//! only if every segment translated, so one failing segment fails only its page.
+//!
 //! Network lives ONLY here — `zola build` stays offline. The OpenRouter call
 //! is behind the [`LlmClient`] trait so unit tests mock it without touching
 //! the network. With `TRANSLATE_URL` set, pages go through the batched
 //! endpoint driver instead: one language is drained at a time, each request
-//! carries at most [`BATCH_MAX_PAGES`] pages and [`BATCH_MAX_TEXT_BYTES`] bytes
-//! of text, and a per-input `ok` flag fails only the page owning that text.
+//! carries at most [`BATCH_MAX_PAGES`] pages, [`BATCH_MAX_TEXTS`] texts and
+//! [`BATCH_MAX_TEXT_BYTES`] bytes of text.
 //!
-//! Field/transport contract ported from landing-website
-//! `backend/cms/openrouter.py` (ADR-003: `openai/gpt-4o-mini`, JSON-object
-//! response, system-prompt → keys). Fields are the Zola page set
-//! {title, description, body}, not the CMS's five-field set.
+//! Transport contract: OpenRouter (`openai/gpt-4o-mini`, JSON-object response)
+//! is sent `{"texts": [...]}` and must answer the same number of strings in the
+//! same order. Fields are the Zola page set {title, description, body} plus
+//! `[extra]` copy.
 
 use std::collections::HashSet;
 use std::env;
@@ -44,6 +51,9 @@ const GLOSSARY: &[&str] = &["Curriculo", "Curriculo ATS", "CurriculoATS"];
 const MAX_TOKENS: u32 = 16384;
 /// Endpoint batching caps: at most this many distinct pages per request.
 const BATCH_MAX_PAGES: usize = 4;
+/// …and at most this many texts: segments are short, so bytes alone would let a
+/// request carry hundreds of them.
+const BATCH_MAX_TEXTS: usize = 128;
 /// …and at most this many bytes of `texts` per request. Bytes, not chars —
 /// the endpoint's request limit is a wire limit.
 const BATCH_MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -157,11 +167,13 @@ pub trait BatchTranslateClient {
 /// → {"translations": ["..."], "ok": [true, true]}
 /// ```
 ///
-/// Requests are bulk: the driver packs whole pages in — at most
-/// [`BATCH_MAX_PAGES`] distinct pages and [`BATCH_MAX_TEXT_BYTES`] bytes of
-/// text per request — and drains one language at a time. Translations come
-/// back in request order, one per input; a per-input false `ok` flag means
-/// that text came back untranslated, and only the page owning it is failed.
+/// Requests are bulk: the driver packs prose segments in — at most
+/// [`BATCH_MAX_PAGES`] distinct pages, [`BATCH_MAX_TEXTS`] texts and
+/// [`BATCH_MAX_TEXT_BYTES`] bytes of text per request — and drains one
+/// language at a time. Translations come back in request order, one per input;
+/// a per-input false `ok` flag means that text came back untranslated, and the
+/// segment is retried as plain fragments (see `translate_segments`) before its
+/// page is failed.
 /// `preserve_terms` (#23 review) carries the caller's own untranslatables —
 /// brand and product names that must survive verbatim — so the endpoint masks
 /// them out of the engine and restores them after (curriculo-ai #1023/#1133).
@@ -200,7 +212,7 @@ impl TranslateApiClient {
 }
 
 /// Shared client constructor. A generous timeout by default: a self-hosted CPU
-/// model is far slower than a hosted LLM, and a page body is the whole request.
+/// model is far slower than a hosted LLM, and a request carries many segments.
 /// Override with `TRANSLATE_TIMEOUT` (seconds, floor 30 — see [`timeout_from_env`]).
 fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder().timeout(timeout).build()?)
@@ -287,7 +299,7 @@ fn build_batch_request(texts: &[&str], lang: &str, preserve_terms: &[String]) ->
 /// Parse a bulk response into one (translation, ok) pair per sent text, in
 /// input order. Envelope semantics ported from the old single-page parser; the
 /// one deliberate change: a per-string false `ok` flag is SOFT here — the flag
-/// rides along on the pair and only the page owning that text is failed.
+/// rides along on the pair and the caller decides what an untranslated text means.
 fn parse_batch_translate_response(text: &str, sent_count: usize) -> Result<Vec<(String, bool)>> {
     let data: Value = serde_json::from_str(text)
         .map_err(|e| anyhow!("translate endpoint non-JSON response: {e}"))?;
@@ -297,7 +309,7 @@ fn parse_batch_translate_response(text: &str, sent_count: usize) -> Result<Vec<(
     // hard errors. `ok` may be a bool, a per-string bool array (false = that
     // string came back as source), or null/absent on older deployments.
     // A per-string false flag is SOFT: the flag rides on that index's pair and
-    // the driver fails only the page owning the text.
+    // the segment pipeline retries it as plain fragments.
     let mut soft = vec![true; sent_count];
     if let Some(ok) = data.get("ok") {
         match ok {
@@ -433,27 +445,48 @@ fn openrouter_translate_texts(
         .as_str()
         .ok_or_else(|| anyhow!("OpenRouter: unexpected shape: {}", take160(&data.to_string())))?;
     let out: Value = serde_json::from_str(content).map_err(|_| {
-        anyhow!("model returned non-JSON (likely truncated at output cap): {}", take160(content))
+        errors::Error::new(ReplyShape(format!(
+            "model returned non-JSON (likely truncated at output cap): {}",
+            take160(content)
+        )))
     })?;
     parse_texts_reply(&out["texts"], texts.len())
 }
 
+/// The model answered, but not in the agreed shape (bad JSON, wrong count, a
+/// non-string item). Only this kind of failure is worth retrying one text at a
+/// time; a transport or HTTP error would just fail 24 more times.
+#[derive(Debug)]
+struct ReplyShape(String);
+
+impl std::fmt::Display for ReplyShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReplyShape {}
+
 /// Pair the model's `texts` array back onto the inputs. A missing, short or
 /// non-string array is an error, never a silent shift or a blank.
 fn parse_texts_reply(reply: &Value, expected: usize) -> Result<Vec<String>> {
+    let shape = |msg: String| errors::Error::new(ReplyShape(msg));
     let items = reply
         .as_array()
-        .ok_or_else(|| anyhow!("model reply has no `texts` array ({expected} expected)"))?;
+        .ok_or_else(|| shape(format!("model reply has no `texts` array ({expected} expected)")))?;
     if items.len() != expected {
-        bail!("model reply `texts` has {} item(s), expected {expected}", items.len());
+        return Err(shape(format!(
+            "model reply `texts` has {} item(s), expected {expected}",
+            items.len()
+        )));
     }
     items
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("model reply `texts` item {i} is {}", json_kind(item)))
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                shape(format!("model reply `texts` item {i} is {}", json_kind(item)))
+            })
         })
         .collect()
 }
@@ -463,15 +496,24 @@ fn parse_texts_reply(reply: &Value, expected: usize) -> Result<Vec<String>> {
 const OPENROUTER_BATCH_TEXTS: usize = 24;
 const OPENROUTER_BATCH_BYTES: usize = 8 * 1024;
 
-/// Answer segment requests through OpenRouter. A batch the model gets wrong
-/// (wrong count, bad JSON) is retried one text at a time, so one bad item
-/// fails only itself.
+/// Answer segment requests through OpenRouter.
 fn openrouter_answers(
     client: &reqwest::blocking::Client,
     requests: &[Request<'_>],
     lang: &str,
     key: &str,
 ) -> Vec<Answer> {
+    answers_in_batches(requests, &mut |texts| openrouter_translate_texts(client, texts, lang, key))
+}
+
+/// Batch `requests` by [`OPENROUTER_BATCH_TEXTS`] and [`OPENROUTER_BATCH_BYTES`]
+/// and answer each batch through `call`. A reply in the wrong shape (count, JSON)
+/// is retried one text at a time, so one bad item fails only itself; any other
+/// error (HTTP, timeout, auth) fails the whole batch at once and is not retried.
+fn answers_in_batches<F>(requests: &[Request<'_>], call: &mut F) -> Vec<Answer>
+where
+    F: FnMut(&[&str]) -> Result<Vec<String>>,
+{
     let mut answers: Vec<Answer> = Vec::with_capacity(requests.len());
     let mut start = 0;
     while start < requests.len() {
@@ -485,22 +527,28 @@ fn openrouter_answers(
             end += 1;
         }
         let texts: Vec<&str> = requests[start..end].iter().map(|r| r.text).collect();
-        match openrouter_translate_texts(client, &texts, lang, key) {
+        match call(&texts) {
             Ok(done) => answers.extend(done.into_iter().map(|t| Ok((t, true)))),
-            Err(e) if texts.len() > 1 => {
+            Err(e) if texts.len() > 1 && e.downcast_ref::<ReplyShape>().is_some() => {
                 log::warn!(
-                    "translate: OpenRouter batch of {} failed ({e}); one by one",
+                    "translate: OpenRouter batch of {} came back malformed ({e}); one by one",
                     texts.len()
                 );
                 for text in &texts {
                     answers.push(
-                        openrouter_translate_texts(client, &[text], lang, key)
-                            .map(|mut one| (one.remove(0), true))
+                        call(&[text])
+                            .and_then(|mut one| {
+                                one.pop().ok_or_else(|| anyhow!("empty reply for one text"))
+                            })
+                            .map(|t| (t, true))
                             .map_err(|e| e.to_string()),
                     );
                 }
             }
-            Err(e) => answers.push(Err(e.to_string())),
+            Err(e) => {
+                let msg = e.to_string();
+                answers.extend(texts.iter().map(|_| Err(msg.clone())));
+            }
         }
         start = end;
     }
@@ -543,7 +591,9 @@ impl FieldDocs {
         let mut at = 0;
         let mut take = |doc: &Doc| {
             let n = doc.segments().count();
-            let text = doc.render(&translated[at..at + n]);
+            // A short slice leaves the trailing segments as their source text.
+            let end = (at + n).min(translated.len());
+            let text = doc.render(&translated[at.min(end)..end]);
             at += n;
             text
         };
@@ -689,7 +739,9 @@ fn no_leftover_placeholders(en: &str, t: &str) -> Result<()> {
 
 fn html_tag_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"<[A-Za-z][^<>]*>").expect("tag regex"))
+    RE.get_or_init(|| {
+        regex::Regex::new(r#"<[A-Za-z](?:[^<>"']|"[^"]*"|'[^']*')*>"#).expect("tag regex")
+    })
 }
 
 /// Attributes whose value is reader-facing text: a translation may localise them.
@@ -697,7 +749,7 @@ fn translatable_attr_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)\b(alt|title|placeholder|aria-label|aria-description|aria-valuetext)\s*=\s*("[^"]*"|'[^']*')"#,
+            r#"(?i)(\s)(alt|title|placeholder|aria-label|aria-description|aria-valuetext)\s*=\s*("[^"]*"|'[^']*')"#,
         )
         .expect("attr regex")
     })
@@ -709,7 +761,7 @@ fn normalized_tags(text: &str) -> Vec<String> {
     html_tag_re()
         .find_iter(text)
         .map(|m| {
-            let blanked = translatable_attr_re().replace_all(m.as_str(), r#"$1="""#);
+            let blanked = translatable_attr_re().replace_all(m.as_str(), r#"$1$2="""#);
             blanked.split_whitespace().collect::<Vec<_>>().join(" ")
         })
         .collect()
@@ -1141,6 +1193,7 @@ fn endpoint_answers<C: BatchTranslateClient>(
             let r = &requests[end];
             let adds_page = !groups.contains(&r.group);
             let over = groups.len() + usize::from(adds_page) > BATCH_MAX_PAGES
+                || end - start >= BATCH_MAX_TEXTS
                 || bytes + r.text.len() > BATCH_MAX_TEXT_BYTES;
             if end > start && over {
                 break;
@@ -2011,95 +2064,7 @@ mod tests {
             });
             TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
         }
-
-        /// Echo `texts` back as `translations`. Packed `XHTML0003X` tokens
-        /// survive; the client must unpack them. Optional `strip_real_tags`
-        /// mimics raw NLLB dropping `<p>` / `<table>` — after pack there are
-        /// none, so unpack still restores structure.
-        fn echo(strip_real_tags: bool) -> Self {
-            use std::io::Write;
-            use std::net::TcpListener;
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let conns = Arc::new(AtomicUsize::new(0));
-            let reqs = Arc::new(AtomicUsize::new(0));
-            let (c2, r2) = (conns.clone(), reqs.clone());
-            std::thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let mut stream = stream;
-                    c2.fetch_add(1, Ordering::SeqCst);
-                    while let Some(body) = read_request_body(&mut stream) {
-                        r2.fetch_add(1, Ordering::SeqCst);
-                        let texts: Vec<String> = serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|v| v["texts"].as_array().cloned())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .map(|t| {
-                                if strip_real_tags {
-                                    TAG_STRIP.replace_all(&t, "").into_owned()
-                                } else {
-                                    t
-                                }
-                            })
-                            .collect();
-                        let out = json!({ "ok": true, "translations": texts }).to_string();
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-                            out.len(),
-                            out
-                        );
-                        if stream.write_all(resp.as_bytes()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
-        }
-
-        fn echo_map(map: fn(&str) -> String) -> Self {
-            use std::io::Write;
-            use std::net::TcpListener;
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let conns = Arc::new(AtomicUsize::new(0));
-            let reqs = Arc::new(AtomicUsize::new(0));
-            let (c2, r2) = (conns.clone(), reqs.clone());
-            std::thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let mut stream = stream;
-                    c2.fetch_add(1, Ordering::SeqCst);
-                    while let Some(body) = read_request_body(&mut stream) {
-                        r2.fetch_add(1, Ordering::SeqCst);
-                        let texts: Vec<String> = serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|v| v["texts"].as_array().cloned())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .map(|t| map(&t))
-                            .collect();
-                        let out = json!({ "ok": true, "translations": texts }).to_string();
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-                            out.len(),
-                            out
-                        );
-                        if stream.write_all(resp.as_bytes()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-            TinyServer { url: format!("http://{addr}/translate"), conns, reqs }
-        }
     }
-
-    static TAG_STRIP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?>").unwrap()
-    });
 
     /// Read one request (headers + Content-Length body) off the stream; None on EOF.
     fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
@@ -2680,30 +2645,6 @@ mod tests {
         assert!(glossary_ok(&en, &lost).is_err());
     }
 
-    /// Mock that counts calls — chunked bodies should invoke translate >1 time.
-    struct CountingClient {
-        calls: Cell<usize>,
-    }
-    impl LlmClient for CountingClient {
-        fn translate(&self, f: &Translatable, lang: &str, _key: &str) -> Result<Translatable> {
-            self.calls.set(self.calls.get() + 1);
-            Ok(Translatable {
-                title: if f.title.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{lang}] {}", f.title)
-                },
-                description: if f.description.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{lang}] {}", f.description)
-                },
-                body: format!("[{lang}] {}", f.body),
-                extra: f.extra.iter().map(|(p, s)| (p.clone(), format!("[{lang}] {s}"))).collect(),
-            })
-        }
-    }
-
     // ── [extra] copy, sections, output checks ──────────────────────────
 
     fn extra_fm() -> &'static str {
@@ -2894,6 +2835,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_texts_reply_must_match_the_request() {
+        let ok = parse_texts_reply(&json!(["Uno", "Dos"]), 2).unwrap();
+        assert_eq!(ok, ["Uno", "Dos"]);
+        for (bad, why) in [
+            (json!(["Uno"]), "short array"),
+            (json!(["Uno", "Dos", "Tres"]), "long array"),
+            (json!(null), "missing array"),
+            (json!(["Uno", 2]), "non-string item"),
+        ] {
+            let err = parse_texts_reply(&bad, 2).unwrap_err();
+            assert!(err.downcast_ref::<ReplyShape>().is_some(), "{why}: {err}");
+        }
+    }
+
+    fn requests_of(texts: &[String]) -> Vec<Request<'_>> {
+        texts.iter().map(|t| Request { group: 0, text: t.as_str() }).collect()
+    }
+
+    #[test]
+    fn openrouter_batches_by_text_count_and_keeps_answers_in_order() {
+        let texts: Vec<String> = (0..60).map(|i| format!("text {i}")).collect();
+        let mut sizes = Vec::new();
+        let answers = answers_in_batches(&requests_of(&texts), &mut |batch: &[&str]| {
+            sizes.push(batch.len());
+            Ok(batch.iter().map(|t| t.to_uppercase()).collect())
+        });
+        assert_eq!(sizes, [24, 24, 12]);
+        assert_eq!(answers.len(), 60);
+        assert_eq!(answers[59], Ok(("TEXT 59".to_string(), true)));
+    }
+
+    #[test]
+    fn openrouter_batches_by_bytes() {
+        let big = "x".repeat(5_000);
+        let texts = vec![big.clone(), big.clone(), big];
+        let mut sizes = Vec::new();
+        answers_in_batches(&requests_of(&texts), &mut |batch: &[&str]| {
+            sizes.push(batch.len());
+            Ok(batch.iter().map(|t| t.to_string()).collect())
+        });
+        assert_eq!(sizes, [1, 1, 1], "5 KB texts: no two fit one 8 KiB request");
+    }
+
+    #[test]
+    fn a_malformed_batch_is_retried_one_text_at_a_time_and_only_the_bad_one_fails() {
+        let texts: Vec<String> = ["alpha", "bad", "gamma"].iter().map(|s| s.to_string()).collect();
+        let mut calls = 0;
+        let answers = answers_in_batches(&requests_of(&texts), &mut |batch: &[&str]| {
+            calls += 1;
+            if batch.len() > 1 {
+                return Err(errors::Error::new(ReplyShape("2 items, expected 3".into())));
+            }
+            if batch[0] == "bad" {
+                return Err(errors::Error::new(ReplyShape("not a string".into())));
+            }
+            Ok(vec![batch[0].to_uppercase()])
+        });
+        assert_eq!(calls, 4, "one batch call, then three singles");
+        assert_eq!(answers[0], Ok(("ALPHA".to_string(), true)));
+        assert_eq!(answers[1], Err("not a string".to_string()));
+        assert_eq!(answers[2], Ok(("GAMMA".to_string(), true)));
+    }
+
+    #[test]
+    fn a_transport_error_fails_the_whole_batch_without_retrying() {
+        let texts: Vec<String> = (0..5).map(|i| format!("text {i}")).collect();
+        let mut calls = 0;
+        let answers = answers_in_batches(&requests_of(&texts), &mut |_: &[&str]| {
+            calls += 1;
+            Err(anyhow!("OpenRouter HTTP 429 Too Many Requests"))
+        });
+        assert_eq!(calls, 1, "HTTP errors are not retried per text");
+        assert_eq!(answers.len(), 5);
+        assert!(answers.iter().all(|a| a.as_ref().is_err_and(|m| m.contains("429"))));
+    }
+
+    #[test]
     fn markup_ok_rejects_leftover_placeholder_sentinels() {
         let en = t("T", "", "<p>Read the docs.</p>");
         for leaked in [
@@ -2927,6 +2945,18 @@ mod tests {
             let err = markup_ok(&en, &t("T", "", broken)).unwrap_err().to_string();
             assert!(err.contains("attribute"), "{broken}: {err}");
         }
+    }
+
+    #[test]
+    fn markup_ok_reads_a_gt_inside_a_quoted_attribute_as_part_of_the_tag() {
+        let en = t("T", "", "<img alt=\"Home > Pricing\" src=\"a.png\">");
+        let es = t("T", "", "<img alt=\"Inicio > Precios\" src=\"a.png\">");
+        assert!(markup_ok(&en, &es).is_ok());
+        let broken = t("T", "", "<img alt=\"Inicio > Precios\" src=\"b.png\">");
+        assert!(markup_ok(&en, &broken).is_err());
+        // data-* look-alikes are not reader-facing
+        let data = t("T", "", "<div data-title=\"Plans\">x</div>");
+        assert!(markup_ok(&data, &t("T", "", "<div data-title=\"Planes\">x</div>")).is_err());
     }
 
     #[test]

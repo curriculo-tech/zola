@@ -59,7 +59,10 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   repeated or reordered, or unchanged, it is retried once as plain-text
   fragments around the markup (no tokens at all), so it cannot lose structure
   either. A fragment the engine returns untouched is accepted only if it does
-  not read as prose (a name, a number); otherwise the page is not written.
+  not read as prose (a name, a number, "FAQ"); otherwise the page is not written.
+  Text kept as written this way is logged (`kept as written (reads as a name)`).
+  On OpenRouter, a batch the model answers in the wrong shape is retried one text
+  at a time; HTTP, auth and timeout errors fail the batch at once.
 - **Never written:** output that loses a brand token, changes the HTML tags, any
   tag attribute other than the reader-facing ones above (a translated `class`
   drops the CSS), inline code or `<code>` content, or leaves a masking
