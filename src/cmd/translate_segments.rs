@@ -343,7 +343,29 @@ fn retry_as_fragments<F>(
             frags.iter().map(move |text| Request { group: segments[*i].0, text: text.as_str() })
         })
         .collect();
-    let answers = send(&requests);
+    let mut answers = send(&requests);
+
+    // A backend can echo a fragment once and translate it the next time (batch
+    // padding, a re-rolled sample). Ask once more for exactly the fragments that
+    // would fail their page, so a transient echo does not cost a whole page.
+    let again: Vec<usize> = requests
+        .iter()
+        .zip(&answers)
+        .enumerate()
+        .filter(|(_, (request, answer))| fragment_failed(request.text, answer))
+        .map(|(n, _)| n)
+        .collect();
+    if !again.is_empty() {
+        let second: Vec<Request<'_>> = again
+            .iter()
+            .map(|&n| Request { group: requests[n].group, text: requests[n].text })
+            .collect();
+        let redone = send(&second);
+        for (n, answer) in again.into_iter().zip(redone) {
+            answers[n] = answer;
+        }
+    }
+
     let mut cursor = 0;
     for (i, frags) in &fragments {
         let mine = answers.get(cursor..cursor + frags.len());
@@ -353,6 +375,15 @@ fn retry_as_fragments<F>(
             None => Err("transport returned too few answers".into()),
         });
     }
+}
+
+/// A fragment answer that would fail its page: prose of four or more words that
+/// came back untranslated (flagged, empty or unchanged). Transport errors are
+/// not retried here.
+fn fragment_failed(source: &str, answer: &Answer) -> bool {
+    let Ok((text, ok)) = answer else { return false };
+    let untranslated = !ok || text.trim().is_empty() || text.trim() == source.trim();
+    untranslated && reads_as_prose(source) && source.split_whitespace().count() > 3
 }
 
 fn join_fragments(seg: &Segment, sources: &[String], answers: &[Answer]) -> Result<String, String> {
@@ -1423,6 +1454,63 @@ mod tests {
         let results = translate_segments(&segs, &mut send);
         assert_eq!(results[0], Ok("Curriculo ATS".to_string()));
         assert!(results[1].as_ref().unwrap_err().contains("untranslated"));
+    }
+
+    #[test]
+    fn a_fragment_echoed_once_is_asked_again_before_the_page_fails() {
+        let doc = Doc::split(
+            "Please <b>read</b> the full guide before you start using it.
+",
+        );
+        let segs: Vec<(usize, &Segment)> = doc.segments().map(|s| (0, s)).collect();
+        let mut asked: Vec<String> = Vec::new();
+        let mut send = |reqs: &[Request<'_>]| -> Vec<Answer> {
+            reqs.iter()
+                .map(|r| {
+                    let seen = asked.iter().filter(|a| *a == r.text).count();
+                    asked.push(r.text.to_string());
+                    if r.text.contains("XHTML") {
+                        // Pass 1 loses its tokens, which forces the fragment pass.
+                        Ok((token_re().replace_all(r.text, "").into_owned(), true))
+                    } else if r.text.starts_with("the full guide") && seen == 0 {
+                        Ok((r.text.to_string(), false))
+                    } else {
+                        Ok((r.text.to_uppercase(), true))
+                    }
+                })
+                .collect()
+        };
+        let results = translate_segments(&segs, &mut send);
+        assert_eq!(
+            results[0],
+            Ok("PLEASE <b>READ</b> THE FULL GUIDE BEFORE YOU START USING IT.".to_string())
+        );
+        let asks = asked.iter().filter(|a| a.starts_with("the full guide")).count();
+        assert_eq!(asks, 2, "asked exactly twice");
+    }
+
+    #[test]
+    fn a_fragment_echoed_twice_fails_its_page() {
+        let doc = Doc::split(
+            "Please <b>read</b> the full guide before you start using it.
+",
+        );
+        let segs: Vec<(usize, &Segment)> = doc.segments().map(|s| (0, s)).collect();
+        let mut send = |reqs: &[Request<'_>]| -> Vec<Answer> {
+            reqs.iter()
+                .map(|r| {
+                    if r.text.contains("XHTML") {
+                        Ok((token_re().replace_all(r.text, "").into_owned(), true))
+                    } else if r.text.starts_with("the full guide") {
+                        Ok((r.text.to_string(), false))
+                    } else {
+                        Ok((r.text.to_uppercase(), true))
+                    }
+                })
+                .collect()
+        };
+        let results = translate_segments(&segs, &mut send);
+        assert!(results[0].as_ref().unwrap_err().contains("untranslated"));
     }
 
     #[test]

@@ -2406,7 +2406,11 @@ mod tests {
             };
             assert_eq!(extra_hash(&fm).as_deref(), Some(source_hash(&en).as_str()), "page {i}");
         }
-        assert_eq!(mock.calls().len(), 2, "one request, then one fragment retry for page 2");
+        assert_eq!(
+            mock.calls().len(),
+            3,
+            "one request, a fragment retry for page 2, and one re-ask of the flagged fragment"
+        );
     }
 
     #[test]
