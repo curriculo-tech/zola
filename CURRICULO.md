@@ -12,6 +12,7 @@ behavior is unchanged; we add three subcommands used by `curriculo-tech/landing-
 | `v0.23.2-curriculo.13` | `zola indexnow` — IndexNow ping for changed content |
 | `v0.23.2-curriculo.14` | graph: `OPENROUTER_URL` / `OPENROUTER_MODEL` env overrides (OpenAI-compatible gateway) |
 | `v0.23.2-curriculo.15` | `zola translate` translates `[extra]` copy and sections, rejects broken or untranslated output, `--adopt` / `--recheck` |
+| `v0.23.2-curriculo.16` | `zola translate` sends only prose segments to the model and copies page structure from the source; checks attribute values, code spans and leftover placeholders |
 
 Landing CI pins the binary via `ZOLA_VERSION` / `ZOLA_BIN_URL` (never `latest`).
 
@@ -44,21 +45,29 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
 - **Writes:** the sibling follows the English front matter with the
   translated strings at their paths. Top-level `[extra]` keys only the sibling
   has (`noindex`, say) are kept.
-- **TRANSLATE_URL HTML pack:** the endpoint client replaces each HTML tag with a
-  fixed-width `XHTML0003X` token before the POST and restores it after. NLLB
-  otherwise drops wrapping `<p>` and whole `<table>` trees, which the markup
-  gate then rejects. Restore **fails the string** (page not written; OpenRouter
-  can retry) if a placeholder is missing, repeated, reordered, or left over —
-  tag *counts* matching is not enough (swapped `<strong>`/`</strong>` still
-  counts). Original whitespace next to each tag is restored, so packing spaces
-  do not leak. OpenRouter is not packed (the prompt already says keep tags).
-  Bare `<` (`<20 min`) is left alone.
-- **Never written:** output that loses a brand token, changes the HTML tags or
-  adds a bare `<` (the cause of footers rendering inside `<main>`), or, on the
-  OpenRouter path, returns prose unchanged (two or more lowercase words, or
-  five or more words in all; brand tokens, acronyms and names do not count).
-  Empty output for a non-empty field, and a changed count of code fences,
-  `{{`/`{%` shortcodes or `](` link targets, are rejected too.
+- **Structure never reaches the model:** a page is split into pieces. Block-level
+  HTML, attributes, code fences, inline code, `{{ }}`/`{% %}` shortcodes, link
+  and image targets, URLs, entities, table pipes and list/heading markers are
+  *kept*: copied from the English source byte for byte. Only short prose
+  segments (a paragraph line, a heading, a table cell, a `placeholder` /
+  `aria-label` / `alt` / `title` value) are translated, so a bad translation can
+  lose words but never a tag, an attribute, a link or the footer. Inline markup
+  inside a sentence (`<strong>`, `[text](url)`, `` `code` ``) rides along as a
+  fixed-width `XHTML0003X` token, restored from the source with its original
+  spacing. Both the OpenRouter and the `TRANSLATE_URL` paths use this.
+- **Fallback, not failure:** when a segment comes back with a token missing,
+  repeated or reordered, or unchanged, it is retried once as plain-text
+  fragments around the markup (no tokens at all), so it cannot lose structure
+  either. A fragment the engine returns untouched is accepted only if it does
+  not read as prose (a name, a number); otherwise the page is not written.
+- **Never written:** output that loses a brand token, changes the HTML tags, any
+  tag attribute other than the reader-facing ones above (a translated `class`
+  drops the CSS), inline code or `<code>` content, or leaves a masking
+  placeholder (`⟦0⟧`, `XHTML0003X`) behind; adds a bare `<` (the cause of
+  footers rendering inside `<main>`); or returns prose unchanged (two or more
+  lowercase words, or five or more words in all; brand tokens, acronyms and
+  names do not count). Empty output for a non-empty field, and a changed count
+  of code fences, `{{`/`{%` shortcodes or `](` link targets, are rejected too.
 - **`--recheck`:** runs the same checks on siblings already stamped fresh and
   removes the stamp from those that fail, so the next run redoes them. Exits
   non-zero when it cleared anything.

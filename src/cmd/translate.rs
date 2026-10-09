@@ -32,6 +32,8 @@ use errors::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::translate_segments::{Answer, Doc, Request, Segment, translate_segments};
+
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Umbrella ADR-003: gpt-4o-mini only, no local models.
 const MODEL: &str = "openai/gpt-4o-mini";
@@ -40,9 +42,6 @@ const MODEL: &str = "openai/gpt-4o-mini";
 /// the retired one-word form, kept so older sources still survive verbatim.
 const GLOSSARY: &[&str] = &["Curriculo", "Curriculo ATS", "CurriculoATS"];
 const MAX_TOKENS: u32 = 16384;
-/// Bodies larger than this are translated in H2-sized chunks so each OpenRouter
-/// call stays under the JSON output cap (the old 113 KB pillar hit truncation).
-const BODY_CHUNK_CHARS: usize = 6_000;
 /// Endpoint batching caps: at most this many distinct pages per request.
 const BATCH_MAX_PAGES: usize = 4;
 /// …and at most this many bytes of `texts` per request. Bytes, not chars —
@@ -252,14 +251,9 @@ impl BatchTranslateClient for TranslateApiClient {
         if texts.is_empty() {
             return Ok(Vec::new()); // the driver never packs an empty batch
         }
-        // NLLB drops wrapping `<p>` and whole `<table>` trees. Pack tags as
-        // fixed-width tokens the model copies. OpenRouter does not pack —
-        // its prompt already says keep tags. Distinct from curriculo-ai
-        // glossary `⟦N⟧` (two maskers on that token collided).
-        let packed: Vec<(String, Vec<HtmlTag>)> =
-            texts.iter().copied().map(pack_html_tags).collect();
-        let packed_refs: Vec<&str> = packed.iter().map(|(s, _)| s.as_str()).collect();
-        let payload = build_batch_request(&packed_refs, lang, &self.preserve_terms);
+        // Structure never reaches the endpoint: the driver sends prose segments
+        // whose inline markup is already a token (see `translate_segments`).
+        let payload = build_batch_request(texts, lang, &self.preserve_terms);
         let resp = self
             .client
             .post(&self.url)
@@ -271,134 +265,8 @@ impl BatchTranslateClient for TranslateApiClient {
         if !status.is_success() {
             bail!("translate endpoint HTTP {status}: {}", take200(&text));
         }
-        let mut out = parse_batch_translate_response(&text, texts.len())?;
-        for (i, ((_, tags), (translation, ok))) in packed.iter().zip(out.iter_mut()).enumerate() {
-            if !*ok {
-                continue;
-            }
-            match unpack_html_tags(translation, tags) {
-                Ok(restored) => *translation = restored,
-                Err(e) => {
-                    // Soft-fail this string: driver skips the page, OpenRouter
-                    // retry can pick it up. Never write leftover XHTML tokens.
-                    log::error!("translate: HTML pack restore failed: {e}");
-                    *translation = texts[i].to_string();
-                    *ok = false;
-                }
-            }
-        }
-        Ok(out)
+        parse_batch_translate_response(&text, texts.len())
     }
-}
-
-/// `XHTML0003X` — 4-digit index so `XHTML0001X` is not a prefix of `XHTML0010X`.
-fn html_pack_token(index: usize) -> String {
-    format!("XHTML{index:04}X")
-}
-
-fn html_pack_token_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)XHTML(\d{4})X").unwrap())
-}
-
-struct HtmlTag {
-    tag: String,
-    /// Whitespace immediately before/after the tag in the source. Restored
-    /// verbatim so packing's extra spaces around the token do not leak
-    /// (`</strong> .` / CJK `用 <strong>`).
-    ws_before: String,
-    ws_after: String,
-}
-
-/// Replace each HTML tag with a padded ` XHTML0003X ` token. Leaves bare
-/// `<` (`<20 min`) and `<!` comments alone — same rule as [`tag_counts`].
-/// Surrounding spaces are recorded so unpack can restore the original
-/// adjacency (no extra space before `.`, none inside CJK).
-fn pack_html_tags(text: &str) -> (String, Vec<HtmlTag>) {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut tags = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'<' {
-            let mut j = i + 1;
-            if j < bytes.len() && bytes[j] == b'/' {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j].is_ascii_alphabetic() {
-                if let Some(rel) = text[i + 1..].find('>') {
-                    let end = i + 1 + rel + 1;
-                    let ws_before = {
-                        let n = text[..i]
-                            .chars()
-                            .rev()
-                            .take_while(|c| c.is_whitespace())
-                            .collect::<String>();
-                        n.chars().rev().collect()
-                    };
-                    let ws_after: String = text[end..].chars().take_while(|c| c.is_whitespace()).collect();
-                    tags.push(HtmlTag {
-                        tag: text[i..end].to_string(),
-                        ws_before,
-                        ws_after,
-                    });
-                    out.push(' ');
-                    out.push_str(&html_pack_token(tags.len() - 1));
-                    out.push(' ');
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        let ch = text[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    (out, tags)
-}
-
-fn placeholder_hits(text: &str) -> Vec<(usize, usize, usize)> {
-    html_pack_token_re()
-        .captures_iter(text)
-        .filter_map(|c| {
-            let m = c.get(0)?;
-            let idx: usize = c.get(1)?.as_str().parse().ok()?;
-            Some((m.start(), m.end(), idx))
-        })
-        .collect()
-}
-
-/// Restore tags. Fails (caller marks ok=false) when:
-/// - placeholders are missing, repeated, or out of original order
-///   (ja/ko/ar can swap `<strong>` / `</strong>` and still match tag counts)
-/// - any `XHTML####X` token remains after restore (engine echoed a spare)
-fn unpack_html_tags(text: &str, tags: &[HtmlTag]) -> Result<String> {
-    let hits = placeholder_hits(text);
-    let expected: Vec<usize> = (0..tags.len()).collect();
-    let got: Vec<usize> = hits.iter().map(|h| h.2).collect();
-    if got != expected {
-        bail!(
-            "HTML placeholders missing, repeated, or reordered (expected {expected:?}, got {got:?})"
-        );
-    }
-    let mut out = text.to_string();
-    for (start, end, idx) in hits.into_iter().rev() {
-        let tag = &tags[idx];
-        let mut lo = start;
-        let mut hi = end;
-        while lo > 0 && out.as_bytes()[lo - 1].is_ascii_whitespace() {
-            lo -= 1;
-        }
-        while hi < out.len() && out.as_bytes()[hi].is_ascii_whitespace() {
-            hi += 1;
-        }
-        let put = format!("{}{}{}", tag.ws_before, tag.tag, tag.ws_after);
-        out.replace_range(lo..hi, &put);
-    }
-    if !placeholder_hits(&out).is_empty() {
-        bail!("HTML placeholder left after restore");
-    }
-    Ok(out)
 }
 
 /// Build one bulk request body. `preserve_terms` is included only when
@@ -515,53 +383,36 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
-/// One OpenRouter JSON-object call for a (possibly partial) page payload.
-fn openrouter_translate_once(
+/// One OpenRouter JSON-object call: translate `texts` into `lang`, one output
+/// string per input, in order. The texts are prose segments (see
+/// `translate_segments`): their markup is already a token, so the model is
+/// never asked to keep structure it can see.
+fn openrouter_translate_texts(
     client: &reqwest::blocking::Client,
-    fields: &Translatable,
+    texts: &[&str],
     lang: &str,
     key: &str,
-    body_only: bool,
-) -> Result<Translatable> {
+) -> Result<Vec<String>> {
     // Any code works: a language outside the named set is described by its code,
     // so adding a language to config.toml is enough to translate into it.
     let name =
         lang_name(lang).map(str::to_string).unwrap_or_else(|| format!("the language {lang}"));
-    let extra_texts: Vec<&str> = if body_only {
-        Vec::new()
-    } else {
-        fields.extra.iter().map(|(_, text)| text.as_str()).collect()
-    };
-    let system = if body_only {
-        format!(
-            "You translate marketing web page BODY markdown into {name}. Translate ONLY human-readable text. \
-            Preserve these brand tokens verbatim, untranslated: {}. \
-            Return a single JSON object with exactly these keys: title, description, body. \
-            Leave title and description as empty strings. No prose.",
-            GLOSSARY.join(", ")
-        )
-    } else {
-        format!(
-            "You translate marketing web content into {name}. Translate ONLY human-readable text. \
-            Preserve these brand tokens verbatim, untranslated: {}. \
-            Return a single JSON object with exactly these keys: title, description, body, extra. \
-            `extra` is an array of short UI strings: return an array of the same length, \
-            translated item for item in the same order. Keep HTML tags exactly as they are. No prose.",
-            GLOSSARY.join(", ")
-        )
-    };
-    let user_title = if body_only { "" } else { fields.title.as_str() };
-    let user_desc = if body_only { "" } else { fields.description.as_str() };
+    let system = format!(
+        "You translate marketing web copy into {name}. You receive a JSON object {{\"texts\": [...]}}. \
+        Translate every string. Return a JSON object {{\"texts\": [...]}} with exactly as many strings \
+        as you received, in the same order, one translation per input; never merge or split items. \
+        Tokens such as XHTML0003X stand for markup: copy each one exactly, once, in the same relative \
+        order, and do not translate, remove, add or renumber them. \
+        Preserve these brand tokens verbatim, untranslated: {}. No prose outside the JSON.",
+        GLOSSARY.join(", ")
+    );
     let payload = json!({
         "model": MODEL,
         "response_format": {"type": "json_object"},
         "max_tokens": MAX_TOKENS,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": json!({
-                "title": user_title, "description": user_desc, "body": fields.body,
-                "extra": extra_texts,
-            }).to_string()},
+            {"role": "user", "content": json!({"texts": texts}).to_string()},
         ],
     });
     let body = serde_json::to_vec(&payload)?;
@@ -584,67 +435,129 @@ fn openrouter_translate_once(
     let out: Value = serde_json::from_str(content).map_err(|_| {
         anyhow!("model returned non-JSON (likely truncated at output cap): {}", take160(content))
     })?;
-    let extra =
-        if body_only { Vec::new() } else { parse_extra_reply(&out["extra"], &fields.extra)? };
-    Ok(Translatable {
-        title: out["title"].as_str().unwrap_or("").to_string(),
-        description: out["description"].as_str().unwrap_or("").to_string(),
-        body: out["body"].as_str().unwrap_or("").to_string(),
-        extra,
-    })
+    parse_texts_reply(&out["texts"], texts.len())
 }
 
-/// Pair the model's `extra` array back onto the source paths. A missing,
-/// short or non-string array is an error, never a silent shift or a blank.
-fn parse_extra_reply(reply: &Value, source: &[(String, String)]) -> Result<Vec<(String, String)>> {
-    if source.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Pair the model's `texts` array back onto the inputs. A missing, short or
+/// non-string array is an error, never a silent shift or a blank.
+fn parse_texts_reply(reply: &Value, expected: usize) -> Result<Vec<String>> {
     let items = reply
         .as_array()
-        .ok_or_else(|| anyhow!("model reply has no `extra` array ({} expected)", source.len()))?;
-    if items.len() != source.len() {
-        bail!("model reply `extra` has {} item(s), expected {}", items.len(), source.len());
+        .ok_or_else(|| anyhow!("model reply has no `texts` array ({expected} expected)"))?;
+    if items.len() != expected {
+        bail!("model reply `texts` has {} item(s), expected {expected}", items.len());
     }
-    source
+    items
         .iter()
-        .zip(items)
-        .map(|((path, _), item)| {
-            let text = item.as_str().ok_or_else(|| {
-                anyhow!("model reply `extra` item for {path} is {}", json_kind(item))
-            })?;
-            Ok((path.clone(), text.to_string()))
+        .enumerate()
+        .map(|(i, item)| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("model reply `texts` item {i} is {}", json_kind(item)))
         })
         .collect()
 }
 
-/// Split a long markdown body on H2 boundaries for chunked translation.
-fn chunk_body(body: &str) -> Vec<String> {
-    let body = body.trim();
-    if body.is_empty() || body.len() <= BODY_CHUNK_CHARS {
-        return vec![body.to_string()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for (i, line) in body.lines().enumerate() {
-        let is_h2 = line.starts_with("## ");
-        if is_h2 && i > 0 && !current.is_empty() && current.len() >= BODY_CHUNK_CHARS / 2 {
-            chunks.push(current.trim_end().to_string());
-            current.clear();
+/// Texts and bytes per OpenRouter request: small enough that the model keeps
+/// count of its array and stays inside the output cap.
+const OPENROUTER_BATCH_TEXTS: usize = 24;
+const OPENROUTER_BATCH_BYTES: usize = 8 * 1024;
+
+/// Answer segment requests through OpenRouter. A batch the model gets wrong
+/// (wrong count, bad JSON) is retried one text at a time, so one bad item
+/// fails only itself.
+fn openrouter_answers(
+    client: &reqwest::blocking::Client,
+    requests: &[Request<'_>],
+    lang: &str,
+    key: &str,
+) -> Vec<Answer> {
+    let mut answers: Vec<Answer> = Vec::with_capacity(requests.len());
+    let mut start = 0;
+    while start < requests.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < requests.len()
+            && end - start < OPENROUTER_BATCH_TEXTS
+            && (end == start || bytes + requests[end].text.len() <= OPENROUTER_BATCH_BYTES)
+        {
+            bytes += requests[end].text.len();
+            end += 1;
         }
-        if !current.is_empty() {
-            current.push('\n');
+        let texts: Vec<&str> = requests[start..end].iter().map(|r| r.text).collect();
+        match openrouter_translate_texts(client, &texts, lang, key) {
+            Ok(done) => answers.extend(done.into_iter().map(|t| Ok((t, true)))),
+            Err(e) if texts.len() > 1 => {
+                log::warn!(
+                    "translate: OpenRouter batch of {} failed ({e}); one by one",
+                    texts.len()
+                );
+                for text in &texts {
+                    answers.push(
+                        openrouter_translate_texts(client, &[text], lang, key)
+                            .map(|mut one| (one.remove(0), true))
+                            .map_err(|e| e.to_string()),
+                    );
+                }
+            }
+            Err(e) => answers.push(Err(e.to_string())),
         }
-        current.push_str(line);
-        if current.len() >= BODY_CHUNK_CHARS {
-            chunks.push(current.trim_end().to_string());
-            current.clear();
+        start = end;
+    }
+    answers
+}
+
+/// A page's translatable fields, each split into structure-safe segments in
+/// field order: title, description, `[extra]` copy, body.
+struct FieldDocs {
+    title: Doc,
+    description: Doc,
+    extra: Vec<(String, Doc)>,
+    body: Doc,
+}
+
+impl FieldDocs {
+    fn split(t: &Translatable) -> Self {
+        Self {
+            title: Doc::split(&t.title),
+            description: Doc::split(&t.description),
+            extra: t.extra.iter().map(|(path, text)| (path.clone(), Doc::split(text))).collect(),
+            body: Doc::split(&t.body),
         }
     }
-    if !current.is_empty() {
-        chunks.push(current.trim_end().to_string());
+
+    fn docs(&self) -> impl Iterator<Item = &Doc> {
+        [&self.title, &self.description]
+            .into_iter()
+            .chain(self.extra.iter().map(|(_, d)| d))
+            .chain(std::iter::once(&self.body))
     }
-    if chunks.is_empty() { vec![body.to_string()] } else { chunks }
+
+    fn segments(&self) -> impl Iterator<Item = &Segment> {
+        self.docs().flat_map(Doc::segments)
+    }
+
+    /// Rebuild the fields from one translation per segment, in
+    /// [`Self::segments`] order.
+    fn render(&self, translated: &[String]) -> Translatable {
+        let mut at = 0;
+        let mut take = |doc: &Doc| {
+            let n = doc.segments().count();
+            let text = doc.render(&translated[at..at + n]);
+            at += n;
+            text
+        };
+        let title = take(&self.title);
+        let description = take(&self.description);
+        let extra = self.extra.iter().map(|(path, doc)| (path.clone(), take(doc))).collect();
+        let body = take(&self.body);
+        Translatable { title, description, body, extra }
+    }
+}
+
+/// Collapse per-segment results: the first failure fails the page.
+fn all_segments_ok(results: Vec<Result<String, String>>) -> Result<Vec<String>> {
+    results.into_iter().collect::<Result<Vec<_>, String>>().map_err(|e| anyhow!("{e}"))
 }
 
 fn translate_fields_openrouter(
@@ -653,58 +566,11 @@ fn translate_fields_openrouter(
     lang: &str,
     key: &str,
 ) -> Result<Translatable> {
-    translate_fields_impl(
-        |f, body_only| openrouter_translate_once(client, f, lang, key, body_only),
-        fields,
-    )
-}
-
-/// Translate title/description once; chunk the body when it exceeds [`BODY_CHUNK_CHARS`].
-fn translate_fields<C: LlmClient>(
-    client: &C,
-    fields: &Translatable,
-    lang: &str,
-    key: &str,
-) -> Result<Translatable> {
-    translate_fields_impl(
-        |f, body_only| {
-            let payload = if body_only {
-                Translatable { body: f.body.clone(), ..Translatable::default() }
-            } else {
-                f.clone()
-            };
-            client.translate(&payload, lang, key)
-        },
-        fields,
-    )
-}
-
-fn translate_fields_impl<F>(mut translate_one: F, fields: &Translatable) -> Result<Translatable>
-where
-    F: FnMut(&Translatable, bool) -> Result<Translatable>,
-{
-    let chunks = chunk_body(&fields.body);
-    if chunks.len() == 1 {
-        return translate_one(fields, false);
-    }
-    // Title, description and [extra] ride with the first chunk only.
-    let head = Translatable { body: chunks[0].clone(), ..fields.clone() };
-    let first = translate_one(&head, false)?;
-    let mut body_out = first.body;
-    for chunk in chunks.iter().skip(1) {
-        let partial = Translatable { body: chunk.clone(), ..Translatable::default() };
-        let t = translate_one(&partial, true)?;
-        if !body_out.is_empty() && !t.body.is_empty() {
-            body_out.push_str("\n\n");
-        }
-        body_out.push_str(&t.body);
-    }
-    Ok(Translatable {
-        title: first.title,
-        description: first.description,
-        body: body_out,
-        extra: first.extra,
-    })
+    let docs = FieldDocs::split(fields);
+    let segments: Vec<(usize, &Segment)> = docs.segments().map(|s| (0, s)).collect();
+    let mut send = |requests: &[Request<'_>]| openrouter_answers(client, requests, lang, key);
+    let translated = all_segments_ok(translate_segments(&segments, &mut send))?;
+    Ok(docs.render(&translated))
 }
 
 /// sha256 over the translatable fields, NUL-separated for an unambiguous boundary.
@@ -770,8 +636,10 @@ pub fn markup_ok(en: &Translatable, t: &Translatable) -> Result<()> {
             bail!("markup: `{mark}` count changed in translation ({a}→{b})");
         }
     }
-    let source = tag_counts(&all_texts(en).collect::<Vec<_>>().join("\n"));
-    let translated = tag_counts(&all_texts(t).collect::<Vec<_>>().join("\n"));
+    let (en_blob, t_blob) =
+        (all_texts(en).collect::<Vec<_>>().join("\n"), all_texts(t).collect::<Vec<_>>().join("\n"));
+    let source = tag_counts(&en_blob);
+    let translated = tag_counts(&t_blob);
     if source.tags != translated.tags {
         let diff: Vec<String> = source
             .tags
@@ -794,6 +662,96 @@ pub fn markup_ok(en: &Translatable, t: &Translatable) -> Result<()> {
     }
     if translated.bare_lt > source.bare_lt {
         bail!("markup: translation adds a bare `<` that would open a bogus tag");
+    }
+    no_leftover_placeholders(&en_blob, &t_blob)?;
+    same_attribute_values(&en_blob, &t_blob)?;
+    same_code_spans(&en_blob, &t_blob)
+}
+
+fn sentinel_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)XHTML\d{4}X|⟦\d*⟧|\bZQ\d+\b").expect("sentinel regex")
+    })
+}
+
+/// A masking token that is in the translation but not in the source was left
+/// behind by a failed restore (`⟦0⟧` from the glossary masker, `XHTML0003X`
+/// from tag packing) and would ship to readers as junk.
+fn no_leftover_placeholders(en: &str, t: &str) -> Result<()> {
+    let count = |s: &str| sentinel_re().find_iter(s).count();
+    if count(t) > count(en) {
+        let first = sentinel_re().find(t).map_or("", |m| m.as_str());
+        bail!("markup: translation carries a leftover placeholder ({first})");
+    }
+    Ok(())
+}
+
+fn html_tag_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"<[A-Za-z][^<>]*>").expect("tag regex"))
+}
+
+/// Attributes whose value is reader-facing text: a translation may localise them.
+fn translatable_attr_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)\b(alt|title|placeholder|aria-label|aria-description|aria-valuetext)\s*=\s*("[^"]*"|'[^']*')"#,
+        )
+        .expect("attr regex")
+    })
+}
+
+/// Every HTML tag as written, minus the values of reader-facing attributes and
+/// with whitespace collapsed, in document order.
+fn normalized_tags(text: &str) -> Vec<String> {
+    html_tag_re()
+        .find_iter(text)
+        .map(|m| {
+            let blanked = translatable_attr_re().replace_all(m.as_str(), r#"$1="""#);
+            blanked.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .collect()
+}
+
+/// `class`, `id`, `href`, `src`, `onclick` and every other non-copy attribute
+/// must come back byte for byte: a translated `class` silently drops the CSS.
+fn same_attribute_values(en: &str, t: &str) -> Result<()> {
+    let (a, b) = (normalized_tags(en), normalized_tags(t));
+    if a.len() != b.len() {
+        return Ok(()); // tag counts differ: reported by the tag-count check
+    }
+    if let Some((x, y)) = a.iter().zip(&b).find(|(x, y)| x != y) {
+        let clip = |s: &str| s.chars().take(80).collect::<String>();
+        bail!(
+            "markup: attribute values changed in translation: `{}` became `{}`",
+            clip(x),
+            clip(y)
+        );
+    }
+    Ok(())
+}
+
+/// Inline code and `<code>` content, outside fenced blocks, in document order.
+fn code_spans(text: &str) -> Vec<String> {
+    static FENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SPAN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let fence = FENCE.get_or_init(|| regex::Regex::new(r"(?s)```.*?```").expect("fence regex"));
+    let span = SPAN.get_or_init(|| {
+        regex::Regex::new(r"(?is)`[^`\n]+`|<code\b[^>]*>.*?</code>").expect("code regex")
+    });
+    let outside = fence.replace_all(text, "");
+    span.find_iter(&outside).map(|m| m.as_str().to_string()).collect()
+}
+
+/// Code is not prose: a model that "translates" a command, flag or JSON key
+/// breaks the instructions it appears in.
+fn same_code_spans(en: &str, t: &str) -> Result<()> {
+    let (a, b) = (code_spans(en), code_spans(t));
+    if a != b {
+        let clip = |v: &[String]| v.iter().take(3).cloned().collect::<Vec<_>>().join(" ");
+        bail!("markup: code spans changed in translation: [{}] became [{}]", clip(&a), clip(&b));
     }
     Ok(())
 }
@@ -858,7 +816,7 @@ fn translatable_words(text: &str) -> (usize, usize) {
     (lower, words.len())
 }
 
-fn reads_as_prose(text: &str) -> bool {
+pub(super) fn reads_as_prose(text: &str) -> bool {
     let (lower, all) = translatable_words(text);
     lower >= PASSTHROUGH_MIN_LOWER || all >= PASSTHROUGH_MIN_WORDS
 }
@@ -1165,21 +1123,51 @@ struct BatchJob {
     sibling: PathBuf,
 }
 
-/// Where a flattened request text came from, for positional reassembly.
-enum BatchSlot {
-    Title,
-    Description,
-    /// Index into the job's `en.extra`.
-    Extra(usize),
-    Body(usize),
-}
-
-/// A flattened request text: its owning job (index into the current language's
-/// job list), its slot, and the text itself.
-struct FlatText {
-    job: usize,
-    slot: BatchSlot,
-    text: String,
+/// Answer segment requests through the endpoint, in batches of at most
+/// [`BATCH_MAX_PAGES`] distinct pages and [`BATCH_MAX_TEXT_BYTES`] bytes. A
+/// failed request fails only the texts in its batch.
+fn endpoint_answers<C: BatchTranslateClient>(
+    client: &C,
+    requests: &[Request<'_>],
+    lang: &str,
+) -> Vec<Answer> {
+    let mut answers: Vec<Answer> = Vec::with_capacity(requests.len());
+    let mut start = 0;
+    while start < requests.len() {
+        let mut end = start;
+        let mut groups: HashSet<usize> = HashSet::new();
+        let mut bytes = 0usize;
+        while end < requests.len() {
+            let r = &requests[end];
+            let adds_page = !groups.contains(&r.group);
+            let over = groups.len() + usize::from(adds_page) > BATCH_MAX_PAGES
+                || bytes + r.text.len() > BATCH_MAX_TEXT_BYTES;
+            if end > start && over {
+                break;
+            }
+            groups.insert(r.group);
+            bytes += r.text.len();
+            end += 1;
+        }
+        let texts: Vec<&str> = requests[start..end].iter().map(|r| r.text).collect();
+        match client.translate_texts(&texts, lang) {
+            Ok(pairs) if pairs.len() == texts.len() => answers.extend(pairs.into_iter().map(Ok)),
+            Ok(pairs) => {
+                let msg = format!(
+                    "endpoint returned {} translations for {} texts",
+                    pairs.len(),
+                    texts.len()
+                );
+                answers.extend(texts.iter().map(|_| Err(msg.clone())));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                answers.extend(texts.iter().map(|_| Err(msg.clone())));
+            }
+        }
+        start = end;
+    }
+    answers
 }
 
 /// Endpoint driver: same walk/parse/hash-gate rules as [`translate_with`], but
@@ -1277,133 +1265,32 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
             continue;
         }
 
-        // Flatten: per job, title → description → [extra] copy → body chunks,
-        // in field order (empty fields are not sent). Every job has ≥1 text —
-        // a job has a body or [extra] copy by the skip above.
-        let mut flat: Vec<FlatText> = Vec::new();
+        // Split every job's fields into structure-safe segments: only prose
+        // goes to the endpoint, the page skeleton is copied from the source.
+        let docs: Vec<FieldDocs> = lang_jobs.iter().map(|j| FieldDocs::split(&j.en)).collect();
+        let mut segments: Vec<(usize, &Segment)> = Vec::new();
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(lang_jobs.len());
-        for (ji, job) in lang_jobs.iter().enumerate() {
-            let start = flat.len();
-            if !job.en.title.is_empty() {
-                flat.push(FlatText { job: ji, slot: BatchSlot::Title, text: job.en.title.clone() });
-            }
-            if !job.en.description.is_empty() {
-                flat.push(FlatText {
-                    job: ji,
-                    slot: BatchSlot::Description,
-                    text: job.en.description.clone(),
-                });
-            }
-            for (ei, (_, text)) in job.en.extra.iter().enumerate() {
-                flat.push(FlatText { job: ji, slot: BatchSlot::Extra(ei), text: text.clone() });
-            }
-            if !job.en.body.is_empty() {
-                for (ci, chunk) in chunk_body(&job.en.body).iter().enumerate() {
-                    flat.push(FlatText { job: ji, slot: BatchSlot::Body(ci), text: chunk.clone() });
-                }
-            }
-            ranges.push((start, flat.len()));
-        }
-
-        // Pack greedily in order: a batch closes when one more text would push
-        // it past the page or byte cap. A lone over-cap text (a monster chunk)
-        // rides alone in its own batch rather than being dropped.
-        let mut batches: Vec<Vec<usize>> = Vec::new();
-        let mut cur: Vec<usize> = Vec::new();
-        let mut cur_jobs: HashSet<usize> = HashSet::new();
-        let mut cur_bytes = 0usize;
-        for (i, ft) in flat.iter().enumerate() {
-            let adds_page = !cur_jobs.contains(&ft.job);
-            if !cur.is_empty()
-                && (cur_jobs.len() + usize::from(adds_page) > BATCH_MAX_PAGES
-                    || cur_bytes + ft.text.len() > BATCH_MAX_TEXT_BYTES)
-            {
-                batches.push(std::mem::take(&mut cur));
-                cur_jobs.clear();
-                cur_bytes = 0;
-            }
-            cur.push(i);
-            cur_jobs.insert(ft.job);
-            cur_bytes += ft.text.len();
-        }
-        if !cur.is_empty() {
-            batches.push(cur);
+        for (ji, doc) in docs.iter().enumerate() {
+            let start = segments.len();
+            segments.extend(doc.segments().map(|s| (ji, s)));
+            ranges.push((start, segments.len()));
         }
 
         // One request in flight at a time: a self-hosted CPU endpoint serves a
         // batch no faster for being asked concurrently.
-        let mut results: Vec<Option<(String, bool)>> = vec![None; flat.len()];
-        let mut failed = vec![false; lang_jobs.len()];
-        for batch in &batches {
-            let texts: Vec<&str> = batch.iter().map(|&i| flat[i].text.as_str()).collect();
-            match client.translate_texts(&texts, lang) {
-                Err(e) => {
-                    // Envelope/HTTP failure: every job owning a text in this
-                    // batch is unwritten and counted, then the run moves on.
-                    for &i in batch {
-                        let ji = flat[i].job;
-                        if !failed[ji] {
-                            failed[ji] = true;
-                            failures += 1;
-                            log::error!(
-                                "translate: {} → {lang} FAILED: {e}",
-                                lang_jobs[ji].page.display()
-                            );
-                        }
-                    }
-                }
-                Ok(pairs) => {
-                    for (&i, pair) in batch.iter().zip(pairs) {
-                        results[i] = Some(pair);
-                    }
-                }
-            }
-        }
+        let mut send = |requests: &[Request<'_>]| endpoint_answers(client, requests, lang);
+        let results = translate_segments(&segments, &mut send);
 
-        // Assemble survivors in job order: slots back onto fields, body chunks
-        // rejoined with the same conditional translate_fields_impl uses.
         for (ji, job) in lang_jobs.iter().enumerate() {
-            if failed[ji] {
-                continue; // already counted + logged above
-            }
             let (start, end) = ranges[ji];
-            let mut t = Translatable::default();
-            let mut ok_all = true;
-            let mut body_seen = 0usize;
-            for i in start..end {
-                // A missing pair means a misbehaving client short-changed the
-                // batch; treat it like a false flag, never as a blank field.
-                let Some((s, ok)) = &results[i] else {
-                    ok_all = false;
-                    break;
-                };
-                if !*ok {
-                    ok_all = false; // this text came back untranslated
+            let t = match all_segments_ok(results[start..end].to_vec()) {
+                Ok(done) => docs[ji].render(&done),
+                Err(e) => {
+                    failures += 1;
+                    log::error!("translate: {} → {lang} FAILED: {e}", job.page.display());
+                    continue; // file intentionally NOT written on failure
                 }
-                match flat[i].slot {
-                    BatchSlot::Title => t.title = s.clone(),
-                    BatchSlot::Description => t.description = s.clone(),
-                    BatchSlot::Extra(ei) => t.extra.push((job.en.extra[ei].0.clone(), s.clone())),
-                    BatchSlot::Body(ci) => {
-                        // Chunks reassemble in request order — the slot index
-                        // is that invariant, so it is checked, not assumed.
-                        debug_assert_eq!(ci, body_seen, "body chunks out of request order");
-                        body_seen += 1;
-                        if !t.body.is_empty() && !s.is_empty() {
-                            t.body.push_str("\n\n");
-                        }
-                        t.body.push_str(s);
-                    }
-                }
-            }
-            if !ok_all {
-                failures += 1;
-                log::error!(
-                    "translate: {} → {lang} FAILED: endpoint reported ok=false — source text returned untranslated, not writing",
-                    job.page.display()
-                );
-                continue;
-            }
+            };
             if let Err(e) = glossary_ok(&job.en, &t).and_then(|()| markup_ok(&job.en, &t)) {
                 failures += 1;
                 log::error!("translate: {} → {lang} FAILED: {e}", job.page.display());
@@ -1680,7 +1567,7 @@ fn read_langs(config_file: &Path) -> Result<(String, Vec<String>)> {
     Ok((default, langs))
 }
 
-fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+pub(super) fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let rd = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1949,29 +1836,6 @@ mod tests {
         let err = parse_batch_translate_response(r#"{"translations":["Titre","Description"]}"#, 3)
             .unwrap_err();
         assert!(format!("{err}").contains("2 translation(s) for 3"));
-    }
-
-    #[test]
-    fn long_body_is_chunked_by_translate_fields_impl() {
-        // Regression: chunking lives inside each client path, so a client that
-        // skips it sends a whole pillar page as one request. Counts the calls
-        // translate_fields_impl makes for an over-cap body.
-        let body = (0..40)
-            .map(|i| format!("## Heading {i}\n\n{}", "word ".repeat(120)))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        assert!(body.len() > BODY_CHUNK_CHARS, "fixture must exceed the cap");
-        let mut calls = 0usize;
-        let out = translate_fields_impl(
-            |f, _body_only| {
-                calls += 1;
-                Ok(f.clone())
-            },
-            &t("T", "D", &body),
-        )
-        .unwrap();
-        assert!(calls > 1, "expected the body to be chunked, got {calls} call(s)");
-        assert_eq!(out.title, "T");
     }
 
     #[test]
@@ -2344,11 +2208,22 @@ mod tests {
     struct MockBatch {
         calls: Mutex<Vec<(Vec<String>, String)>>,
         script: Mutex<Vec<Result<Vec<(String, bool)>, String>>>,
+        /// Put in front of every unscripted answer, so prose is visibly
+        /// translated (an unchanged prose answer counts as untranslated).
+        prefix: String,
     }
 
     impl MockBatch {
         fn new() -> Self {
-            MockBatch { calls: Mutex::new(Vec::new()), script: Mutex::new(Vec::new()) }
+            MockBatch {
+                calls: Mutex::new(Vec::new()),
+                script: Mutex::new(Vec::new()),
+                prefix: String::new(),
+            }
+        }
+
+        fn prefixing(prefix: &str) -> Self {
+            MockBatch { prefix: prefix.to_string(), ..Self::new() }
         }
 
         /// Script one successful response: (translation, ok) per text.
@@ -2385,7 +2260,7 @@ mod tests {
                 .push((texts.iter().map(|s| s.to_string()).collect(), lang.to_string()));
             let mut script = self.script.lock().unwrap();
             if script.is_empty() {
-                return Ok(texts.iter().map(|t| (t.to_string(), true)).collect());
+                return Ok(texts.iter().map(|t| (format!("{}{t}", self.prefix), true)).collect());
             }
             script.remove(0).map_err(|e| anyhow!("{e}"))
         }
@@ -2460,9 +2335,9 @@ mod tests {
     fn oversized_page_spans_batches_and_reassembles_in_order() {
         let fx = Fixture::new();
         one_lang_config(&fx);
-        // One ~24 KB body: its chunks alone exceed the 16 KiB request cap, so
+        // One ~24 KB body: its segments alone exceed the 16 KiB request cap, so
         // the page spans batches. The echo mock makes the written body equal to
-        // the chunk join — order and separators both checked.
+        // the source — segment order and every separator are checked.
         let body = (0..24)
             .map(|i| format!("## H{i}\n\n{}", "x".repeat(1000)))
             .collect::<Vec<_>>()
@@ -2474,8 +2349,7 @@ mod tests {
         assert!(calls.len() >= 2, "over-cap page must span batches, got {}", calls.len());
         let sibling = fx.root().join("content/post/index.es.md");
         let (fm, written) = parse_page(&sibling).unwrap();
-        let expected = chunk_body(&body).join("\n\n");
-        assert_eq!(written.trim(), expected, "chunks must rejoin in request order");
+        assert_eq!(written.trim(), body.trim(), "segments must rejoin in request order");
         // …and the hash stamp matches the en fields, so the pair is now fresh.
         let en = Translatable {
             title: "T".into(),
@@ -2526,12 +2400,14 @@ mod tests {
             fx.write_page(
                 &format!("content/p{i}/index.md"),
                 &format!("title = \"P{i}\"\ndescription = \"D{i}\"\n"),
-                &format!("Body {i}.\n"),
+                &format!("Body {i} is plain prose.\n"),
             );
         }
         let mock = MockBatch::new();
         // All four pages fit one request (12 texts); page 2's three slots come
-        // back flagged untranslated.
+        // back flagged untranslated. Its title and description are a name and a
+        // code (not prose, so they may read the same); its body is prose, so it
+        // is retried once as fragments, comes back unchanged and fails the page.
         mock.push_ok_flags(vec![
             ("x0", true),
             ("x1", true),
@@ -2560,12 +2436,12 @@ mod tests {
             let en = Translatable {
                 title: format!("P{i}"),
                 description: format!("D{i}"),
-                body: format!("Body {i}."),
+                body: format!("Body {i} is plain prose."),
                 ..Translatable::default()
             };
             assert_eq!(extra_hash(&fm).as_deref(), Some(source_hash(&en).as_str()), "page {i}");
         }
-        assert_eq!(mock.calls().len(), 1, "all four pages fit one request");
+        assert_eq!(mock.calls().len(), 2, "one request, then one fragment retry for page 2");
     }
 
     #[test]
@@ -2804,17 +2680,6 @@ mod tests {
         assert!(glossary_ok(&en, &lost).is_err());
     }
 
-    #[test]
-    fn chunk_body_splits_on_h2_when_large() {
-        let h2 = "## Section\n\n";
-        let para = "word ".repeat(800); // ~4k chars each
-        let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
-        let chunks = chunk_body(&body);
-        assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
-        let joined = chunks.join("\n\n");
-        assert!(joined.contains("## Section"));
-    }
-
     /// Mock that counts calls — chunked bodies should invoke translate >1 time.
     struct CountingClient {
         calls: Cell<usize>,
@@ -2837,24 +2702,6 @@ mod tests {
                 extra: f.extra.iter().map(|(p, s)| (p.clone(), format!("[{lang}] {s}"))).collect(),
             })
         }
-    }
-
-    #[test]
-    fn large_body_uses_multiple_translate_calls() {
-        let h2 = "## Part\n\n";
-        let para = "Curriculo ".repeat(1200);
-        let body = format!("{h2}{para}\n{h2}{para}\n{h2}{para}");
-        let en = Translatable {
-            title: "Big Curriculo page".into(),
-            description: "desc".into(),
-            body,
-            ..Translatable::default()
-        };
-        let c = CountingClient { calls: Cell::new(0) };
-        let out = translate_fields(&c, &en, "es", "k").unwrap();
-        assert!(c.calls.get() > 1, "chunked body should call translate more than once");
-        assert!(out.body.contains("[es]"));
-        assert!(out.title.contains("Curriculo"));
     }
 
     // ── [extra] copy, sections, output checks ──────────────────────────
@@ -2994,136 +2841,107 @@ mod tests {
         assert!(markup_ok(&src_lt, &t("T", "", "Listo en <20 min.")).is_ok());
     }
 
-    #[test]
-    fn pack_html_tags_round_trips_and_skips_bare_lt() {
-        let src = "<p>Hire faster with <strong>Curriculo ATS</strong>.</p> Setup in <20 min.";
-        let (packed, tags) = pack_html_tags(src);
-        let names: Vec<&str> = tags.iter().map(|t| t.tag.as_str()).collect();
-        assert_eq!(names, vec!["<p>", "<strong>", "</strong>", "</p>"]);
-        assert!(packed.contains("XHTML0000X"));
-        assert!(packed.contains("XHTML0003X"));
-        assert!(!packed.contains("<p>"));
-        assert!(packed.contains("<20 min"));
-        let restored = unpack_html_tags(&packed, &tags).unwrap();
-        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
-        assert!(restored.contains("<20 min"));
-        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    /// An endpoint that behaves like the failure we saw in production: on its
+    /// first answer to a text it drops every markup token and uppercases the
+    /// prose; asked again (the plain-fragment retry) it answers cleanly.
+    struct TokenDroppingEndpoint {
+        asked: Mutex<HashSet<String>>,
+    }
+
+    impl BatchTranslateClient for TokenDroppingEndpoint {
+        fn translate_texts(&self, texts: &[&str], _lang: &str) -> Result<Vec<(String, bool)>> {
+            let mut asked = self.asked.lock().unwrap();
+            let token = regex::Regex::new(r"(?i)XHTML\d{4}X").unwrap();
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let first_time = asked.insert(t.to_string());
+                    let text = if first_time {
+                        token.replace_all(t, "").into_owned()
+                    } else {
+                        t.to_string()
+                    };
+                    (text.to_uppercase(), true)
+                })
+                .collect())
+        }
     }
 
     #[test]
-    fn unpack_html_tags_does_not_eat_index_ten_when_restoring_one() {
-        // 12 tags: unpadded XHTML1X is a prefix of XHTML10X.
-        let src = (0..12).map(|i| format!("<td>{i}</td>")).collect::<String>();
-        let (packed, tags) = pack_html_tags(&src);
-        assert!(packed.contains("XHTML0001X"));
-        assert!(packed.contains("XHTML0010X"));
-        assert!(packed.contains("XHTML0011X"));
-        let restored = unpack_html_tags(&packed, &tags).unwrap();
-        assert_eq!(tag_counts(&src).tags, tag_counts(&restored).tags);
-        assert_eq!(tags.len(), 24, "open+close per cell");
-        let lower = packed.replace("XHTML0010X", "xhtml0010x");
+    fn a_tag_dropping_endpoint_cannot_damage_the_written_page() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        let body = "<div class=\"hero\" id=\"top\">\n<h3>Find talent fast</h3>\n\
+            <p>Screen <strong>every</strong> resume, then <a href=\"/pricing/\">compare plans</a> today.</p>\n\
+            </div>\n\nRead [the guide](/guide/) and run `zola build` now.\n";
+        fx.write_page(
+            "content/post/index.md",
+            "title = \"Hiring tools\"\ndescription = \"Fast hiring\"\n",
+            body,
+        );
+        let endpoint = TokenDroppingEndpoint { asked: Mutex::new(HashSet::new()) };
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &endpoint).unwrap();
+        let (_, written) = parse_page(&fx.root().join("content/post/index.es.md")).unwrap();
         assert_eq!(
-            tag_counts(&src).tags,
-            tag_counts(&unpack_html_tags(&lower, &tags).unwrap()).tags
+            written.trim(),
+            "<div class=\"hero\" id=\"top\">\n<h3>FIND TALENT FAST</h3>\n\
+            <p>SCREEN <strong>EVERY</strong> RESUME, THEN <a href=\"/pricing/\">COMPARE PLANS</a> TODAY.</p>\n\
+            </div>\n\nREAD [THE GUIDE](/guide/) AND RUN `zola build` NOW."
         );
+        let en = Translatable { body: body.trim().to_string(), ..Translatable::default() };
+        let es = Translatable { body: written.trim().to_string(), ..Translatable::default() };
+        markup_ok(&en, &es).expect("structure is intact by construction");
     }
 
     #[test]
-    fn unpack_html_tags_survives_nllb_dropping_real_tags() {
-        // What raw NLLB does to a table: eat the tags, keep inner words.
-        // Packed form has no real tags, so a tag-dropping model still
-        // round-trips structure after unpack.
-        let src = "<table><tr><td>Plan</td><td>Price</td></tr></table>";
-        let (packed, tags) = pack_html_tags(src);
-        let stripped = packed.replace('<', "").replace('>', "");
-        let restored = unpack_html_tags(&stripped, &tags).unwrap();
-        assert_eq!(tag_counts(src).tags, tag_counts(&restored).tags);
-        assert!(markup_ok(&t("T", "", src), &t("T", "", &restored)).is_ok());
+    fn markup_ok_rejects_leftover_placeholder_sentinels() {
+        let en = t("T", "", "<p>Read the docs.</p>");
+        for leaked in [
+            "<p>Lisez ⟦0⟧ les docs.</p>",
+            "<p>Lisez XHTML0003X les docs.</p>",
+            "<p>Lisez ZQ12 les docs.</p>",
+        ] {
+            let err = markup_ok(&en, &t("T", "", leaked)).unwrap_err().to_string();
+            assert!(err.contains("placeholder"), "{leaked}: {err}");
+        }
+        // a sentinel-looking string that is really in the source is not a leak
+        let src = t("T", "", "Use the ⟦0⟧ marker.");
+        assert!(markup_ok(&src, &t("T", "", "Utilisez le marqueur ⟦0⟧.")).is_ok());
     }
 
     #[test]
-    fn unpack_rejects_leftover_placeholder() {
-        let src = "<p>Ready to hire?</p>";
-        let (packed, tags) = pack_html_tags(src);
-        let dup = format!("{packed} XHTML0001X");
-        let err = unpack_html_tags(&dup, &tags).unwrap_err().to_string();
-        assert!(err.contains("reordered") || err.contains("repeated") || err.contains("missing"), "{err}");
-    }
-
-    #[test]
-    fn unpack_rejects_reordered_placeholders() {
-        // ja/ko/ar can swap open/close while keeping counts.
-        let src = "Click <strong>here</strong>";
-        let (packed, tags) = pack_html_tags(src);
-        let swapped = packed.replace("XHTML0000X", "TMP").replace("XHTML0001X", "XHTML0000X").replace("TMP", "XHTML0001X");
-        let err = unpack_html_tags(&swapped, &tags).unwrap_err().to_string();
-        assert!(err.contains("reordered") || err.contains("got"), "{err}");
-    }
-
-    #[test]
-    fn unpack_restores_original_spacing() {
-        let src = "Hire faster with <strong>Curriculo ATS</strong>.";
-        let (packed, tags) = pack_html_tags(src);
-        let restored = unpack_html_tags(&packed, &tags).unwrap();
-        assert_eq!(restored, src, "no space before the full stop");
-        let cjk = "用<strong>Curriculo ATS</strong>更快";
-        let (p2, t2) = pack_html_tags(cjk);
-        assert_eq!(unpack_html_tags(&p2, &t2).unwrap(), cjk);
-    }
-
-    #[test]
-    fn translate_api_client_restores_html_when_endpoint_echoes_packed_tokens() {
-        let fx = Fixture::new();
-        one_lang_config(&fx);
-        fx.write_page(
-            "content/post/index.md",
-            "title = \"Hire with Curriculo ATS\"\ndescription = \"Ready to hire with precision?\"\n",
-            "<p>See the <a href=\"/ai-resume-builder/\">AI resume builder</a>.</p>\n<table><tr><td>Plan</td><td>Price</td></tr></table>\n",
+    fn markup_ok_rejects_changed_attribute_values_but_allows_translated_alt_and_title() {
+        let en =
+            t("T", "", "<div class=\"hero\" id=\"top\"><img src=\"/a.png\" alt=\"A chart\"></div>");
+        let alt_ok = t(
+            "T",
+            "",
+            "<div class=\"hero\" id=\"top\"><img src=\"/a.png\" alt=\"Un graphique\"></div>",
         );
-        let server = TinyServer::echo(true);
-        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
-        let es = fx.page_body("content/post/index.es.md");
-        assert!(es.contains("<p>"), "{es}");
-        assert!(es.contains("</p>"), "{es}");
-        assert!(es.contains("<table>"), "{es}");
-        assert!(es.contains("</table>"), "{es}");
-        assert!(es.contains("<a href=\"/ai-resume-builder/\">"), "{es}");
-        assert!(!es.contains("XHTML"), "tokens must be unpacked: {es}");
-        assert!(server.reqs.load(Ordering::SeqCst) >= 1);
+        assert!(markup_ok(&en, &alt_ok).is_ok());
+        for broken in [
+            "<div class=\"héros\" id=\"top\"><img src=\"/a.png\" alt=\"Un graphique\"></div>",
+            "<div class=\"hero\" id=\"haut\"><img src=\"/a.png\" alt=\"Un graphique\"></div>",
+            "<div class=\"hero\" id=\"top\"><img src=\"/fr/a.png\" alt=\"Un graphique\"></div>",
+        ] {
+            let err = markup_ok(&en, &t("T", "", broken)).unwrap_err().to_string();
+            assert!(err.contains("attribute"), "{broken}: {err}");
+        }
     }
 
     #[test]
-    fn translate_api_client_plain_extra_has_no_pack_tokens() {
-        let fx = Fixture::new();
-        one_lang_config(&fx);
-        fx.write_page("content/_index.md", extra_fm(), "\n");
-        let server = TinyServer::echo(false);
-        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
-        let es = fx.page_body("content/_index.es.md");
-        assert!(!es.contains("XHTML"), "{es}");
-        assert!(es.contains("Start Free") || es.contains("Case studies"), "{es}");
-    }
-
-    #[test]
-    fn translate_api_client_rejects_leftover_placeholder_and_writes_nothing() {
-        let fx = Fixture::new();
-        one_lang_config(&fx);
-        fx.write_page(
-            "content/post/index.md",
-            "title = \"T\"\ndescription = \"D\"\n",
-            "<p>Ready to hire?</p>\n",
+    fn markup_ok_rejects_translated_code_spans() {
+        let en = t("T", "", "Run `zola build` and <code>--root</code> now.");
+        assert!(
+            markup_ok(&en, &t("T", "", "Exécutez `zola build` et <code>--root</code> ici."))
+                .is_ok()
         );
-        let server = TinyServer::echo_map(|t| format!("{t} XHTML0001X"));
-        let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &client);
-        assert!(res.is_err(), "leftover placeholder must fail the page");
-        assert!(!fx.root().join("content/post/index.es.md").exists());
-        let es = fx.root().join("content/post/index.es.md");
-        if es.exists() {
-            let body = fs::read_to_string(&es).unwrap();
-            assert!(!body.contains("XHTML"), "must not publish leftover tokens: {body}");
+        for broken in [
+            "Exécutez `zola construire` et <code>--root</code> ici.",
+            "Exécutez `zola build` et <code>--racine</code> ici.",
+        ] {
+            let err = markup_ok(&en, &t("T", "", broken)).unwrap_err().to_string();
+            assert!(err.contains("code"), "{broken}: {err}");
         }
     }
 
@@ -3228,14 +3046,14 @@ mod tests {
         let fx = Fixture::new();
         one_lang_config(&fx);
         fx.write_page("content/_index.md", extra_fm(), "\n");
-        let mock = MockBatch::new();
+        let mock = MockBatch::prefixing("ES ");
         translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
         let sent = mock.texts_of(0);
         assert!(sent.contains(&"Start Free".to_string()));
         assert!(sent.contains(&"Case studies".to_string()));
         assert!(!sent.iter().any(|s| s.starts_with('{') || s == "impact_scoring" || s.is_empty()));
         let es = fm_of(&fx, "content/_index.es.md");
-        assert_eq!(es["extra"]["cards"][0]["items"][1].as_str(), Some("Case studies"));
+        assert_eq!(es["extra"]["cards"][0]["items"][1].as_str(), Some("ES Case studies"));
         assert!(es["extra"].get("source_hash").is_some());
     }
 
@@ -3363,16 +3181,5 @@ mod tests {
         assert!(es.get("aliases").is_none(), "an alias is an English URL, it would collide");
         let fr = fm_of(&fx, "content/eng-root/index.fr.md");
         assert_eq!(fr["path"].as_str(), Some("/fr/engineering/root/"));
-    }
-
-    #[test]
-    fn extra_reply_must_match_the_source_shape() {
-        let src = vec![("a".to_string(), "One".to_string()), ("b".to_string(), "Two".to_string())];
-        let ok = parse_extra_reply(&json!(["Uno", "Dos"]), &src).unwrap();
-        assert_eq!(ok, vec![("a".into(), "Uno".into()), ("b".into(), "Dos".into())]);
-        assert!(parse_extra_reply(&json!(["Uno"]), &src).is_err(), "short array");
-        assert!(parse_extra_reply(&json!(null), &src).is_err(), "missing array");
-        assert!(parse_extra_reply(&json!(["Uno", 2]), &src).is_err(), "non-string item");
-        assert!(parse_extra_reply(&json!(null), &[]).unwrap().is_empty());
     }
 }
