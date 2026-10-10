@@ -1,4 +1,5 @@
-# ADR-008 / Z-2: the ONLY workflow on this fork.
+# ADR-008 / Z-2: the release workflow on this fork (see also test.yml, which
+# runs the binary's tests on PRs — same self-hosted runner, no hosted minutes).
 # Replaces upstream's GitHub-hosted docs/release/build-and-test workflows
 # (deleted — they would burn GitHub-hosted minutes). Builds the release binary
 # on the org's self-hosted tailnet runner (the NixOS box) and attaches it to the
