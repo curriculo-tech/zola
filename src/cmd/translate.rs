@@ -570,7 +570,7 @@ impl FieldDocs {
             title: Doc::split(&t.title),
             description: Doc::split(&t.description),
             extra: t.extra.iter().map(|(path, text)| (path.clone(), Doc::split(text))).collect(),
-            body: Doc::split(&t.body),
+            body: Doc::split_markdown(&t.body),
         }
     }
 

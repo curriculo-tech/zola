@@ -33,6 +33,11 @@ pub struct Segment {
     /// Set for an attribute value (`placeholder="..."`): the quote char the
     /// translation must not contain, escaped as an entity on render.
     quote: Option<char>,
+    /// Inside a markdown table row: a `|` in the translation would add a column.
+    table: bool,
+    /// Starts a markdown line: a translation opening with `- `, `# `, `1. ` or
+    /// `> ` would turn the paragraph into a list item, heading or quote.
+    line_start: bool,
 }
 
 /// A piece of a split document.
@@ -51,8 +56,15 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// Split a plain string (a title, a description, `[extra]` copy).
     pub fn split(text: &str) -> Self {
-        Self { pieces: Splitter::new().run(text) }
+        Self { pieces: Splitter::new(false).run(text) }
+    }
+
+    /// Split a markdown page body: additionally marks segments that start a
+    /// markdown line, so a translation cannot open a list, heading or quote.
+    pub fn split_markdown(text: &str) -> Self {
+        Self { pieces: Splitter::new(true).run(text) }
     }
 
     pub fn segments(&self) -> impl Iterator<Item = &Segment> {
@@ -101,6 +113,28 @@ fn has_prose(text: &str) -> bool {
     text.chars().any(char::is_alphabetic)
 }
 
+/// `|` not already escaped becomes `\|`.
+fn escape_bare_pipes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev = None;
+    for c in text.chars() {
+        if c == '|' && prev != Some('\\') {
+            out.push('\\');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
+/// A markdown block marker at the start of a line: list bullet, ordered-list
+/// number, heading or blockquote. The digit form matches only the marker, so
+/// the escape lands before its `.` or `)`.
+fn block_marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:[-*+]\s|#{1,6}(?:\s|$)|\d{1,9}[.)]\s|>)").expect("marker regex"))
+}
+
 fn lead_ws(s: &str) -> &str {
     &s[..s.len() - s.trim_start().len()]
 }
@@ -121,13 +155,21 @@ impl Segment {
     }
 
     /// A translation made safe to sit where this segment sat: inside an
-    /// attribute it must not contain the attribute's own quote.
+    /// attribute it must not contain the attribute's own quote; in a table row
+    /// a bare `|` is escaped; at the start of a markdown line a leading block
+    /// marker is escaped. The source never needs it: those were kept as structure.
     fn escaped(&self, translated: &str) -> String {
         match self.quote {
-            Some('"') => translated.replace('"', "&quot;"),
-            Some(q) => translated.replace(q, "&#39;"),
-            None => translated.to_string(),
+            Some('"') => return translated.replace('"', "&quot;"),
+            Some(q) => return translated.replace(q, "&#39;"),
+            None => {}
         }
+        let mut out = if self.table { escape_bare_pipes(translated) } else { translated.to_string() };
+        if let Some(m) = block_marker_re().find(&out).filter(|_| self.line_start) {
+            let at = m.as_str().find(['.', ')']).unwrap_or(0);
+            out.insert(m.start() + at, '\\');
+        }
+        out
     }
 
     /// The text without inline constructs, for prose checks.
@@ -497,6 +539,10 @@ struct Splitter {
     /// Line terminator of the previous line, not yet emitted: it joins the
     /// next line into the same segment when both are lines of one paragraph.
     pending_eol: String,
+    /// The text is a markdown body, where a line start is block structure.
+    markdown: bool,
+    /// The line being scanned is a table row.
+    table: bool,
 }
 
 enum Angle {
@@ -518,8 +564,28 @@ enum Angle {
 }
 
 impl Splitter {
-    fn new() -> Self {
-        Self { pieces: Vec::new(), run: Vec::new(), open: Open::None, pending_eol: String::new() }
+    fn new(markdown: bool) -> Self {
+        Self {
+            pieces: Vec::new(),
+            run: Vec::new(),
+            open: Open::None,
+            pending_eol: String::new(),
+            markdown,
+            table: false,
+        }
+    }
+
+    /// Nothing but whitespace and kept block markers precede the next piece on
+    /// its line, so a segment placed here starts a markdown line.
+    fn at_line_start(&self) -> bool {
+        let line_so_far = |k: &str| k.rfind('\n').map_or(k, |i| &k[i + 1..]).to_string();
+        let tail = match self.pieces.last() {
+            None => return true,
+            Some(Piece::Text(_)) => return false,
+            Some(Piece::Keep(k)) if k.contains('\n') || self.pieces.len() == 1 => line_so_far(k),
+            Some(Piece::Keep(_)) => return false,
+        };
+        prefix_re().find(&tail).map_or(tail.is_empty(), |m| m.end() == tail.len())
     }
 
     fn run(mut self, text: &str) -> Vec<Piece> {
@@ -650,7 +716,8 @@ impl Splitter {
             self.push_keep(&head);
         }
         if !items.is_empty() {
-            self.pieces.push(Piece::Text(Segment { items, quote: None }));
+            let line_start = self.markdown && !self.table && self.at_line_start();
+            self.pieces.push(Piece::Text(Segment { items, quote: None, table: self.table, line_start }));
         }
         if !tail.is_empty() {
             self.push_keep(&tail);
@@ -683,9 +750,10 @@ impl Splitter {
             self.keep(rest);
             return;
         }
+        let table = rest.trim_start().starts_with('|');
+        self.table = table;
         self.keep(&rest[..prefix_len]);
         let body = &rest[prefix_len..];
-        let table = rest.trim_start().starts_with('|');
         self.scan(body, table);
     }
 
@@ -901,6 +969,8 @@ impl Splitter {
             self.pieces.push(Piece::Text(Segment {
                 items: vec![Item::Text(tag[start..end].to_string())],
                 quote: Some(quote),
+                table: false,
+                line_start: false,
             }));
             cursor = end;
         }
@@ -1165,6 +1235,65 @@ mod tests {
         re.find_iter(text)
             .map(|m| attr_text_re().replace_all(m.as_str(), "ATTR").into_owned())
             .collect()
+    }
+
+    /// Render a markdown body with every segment replaced by `f(source)`.
+    fn render_md(src: &str, f: impl Fn(&str) -> String) -> String {
+        let doc = Doc::split_markdown(src);
+        let out: Vec<String> = doc.segments().map(|s| f(&s.source())).collect();
+        doc.render(&out)
+    }
+
+    #[test]
+    fn a_pipe_in_a_translated_table_cell_is_escaped() {
+        let src = "| Plan | Price |\n|---|---|\n| Starter plan | Free forever |\n";
+        let out = render_md(src, |s| s.replace("Free forever", "Gratuit | pour toujours"));
+        assert_eq!(out, "| Plan | Price |\n|---|---|\n| Starter plan | Gratuit \\| pour toujours |\n");
+        // Already escaped stays single-escaped.
+        let out = render_md(src, |s| s.replace("Free forever", "a \\| b"));
+        assert!(out.contains("| a \\| b |"), "{out}");
+    }
+
+    #[test]
+    fn a_pipe_outside_a_table_is_left_alone() {
+        let out = render_md("Plans start free.\n", |_| "Gratuit | toujours".into());
+        assert_eq!(out, "Gratuit | toujours\n");
+    }
+
+    #[test]
+    fn a_leading_block_marker_in_a_translated_paragraph_is_escaped() {
+        let cases = [
+            ("- Analysez chaque CV", "\\- Analysez chaque CV"),
+            ("# Recrutez", "\\# Recrutez"),
+            ("1. Premier", "1\\. Premier"),
+            ("> Citation", "\\> Citation"),
+            ("+ Plus", "\\+ Plus"),
+        ];
+        for (translated, want) in cases {
+            let out = render_md("Intro line here.\n\nScreen every resume.\n", |s| {
+                if s.starts_with("Screen") { translated.to_string() } else { s.to_string() }
+            });
+            assert_eq!(out, format!("Intro line here.\n\n{want}\n"), "for {translated:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_after_a_kept_list_bullet_is_escaped_too() {
+        let out = render_md("- Screen every resume.\n", |_| "# Analysez".into());
+        assert_eq!(out, "- \\# Analysez\n");
+    }
+
+    #[test]
+    fn markers_mid_line_in_html_or_plain_fields_are_left_alone() {
+        // Mid-line, after an inline construct: cannot start a block.
+        let out = render_md("See **this** now.\n", |s| s.replace(" now.", "- maintenant."));
+        assert!(!out.contains('\\'), "{out}");
+        // Inside an HTML line: markdown escapes would render literally there.
+        let out = render_md("<p>Screen every resume.</p>\n", |_| "- Analysez".into());
+        assert_eq!(out, "<p>- Analysez</p>\n");
+        // A title or description is not markdown.
+        let doc = Doc::split("Hire faster");
+        assert_eq!(doc.render(&["- Recrutez".to_string()]), "- Recrutez");
     }
 
     #[test]
