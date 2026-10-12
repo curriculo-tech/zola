@@ -1,0 +1,31 @@
+# Second workflow on this fork, added alongside release.yml.
+#
+# ADR-008 / Z-2 deleted upstream's build-and-test workflow because it burned
+# GitHub-hosted minutes. That reason does not apply here: this runs on the org's
+# self-hosted tailnet runner, the same box release.yml builds on. Without it a PR
+# that breaks `zola translate` reaches a release tag with nothing having compiled
+# it, which is how landing-website#232 shipped.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: [self-hosted, tailnet]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole binary suite, not just translate: the subcommands share the
+      # site-loading path, so a translate change can break graph or indexnow.
+      - name: cargo test --bin zola
+        run: nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc -c cargo test --bin zola
+
+      # Informational, like core-api's eslint and tsc: the fork carries 32
+      # inherited clippy warnings (4 of them in src/cmd/translate.rs), so
+      # -D warnings would fail every PR until an unrelated cleanup lands.
+      - name: cargo clippy --bin zola
+        continue-on-error: true
+        run: nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc nixpkgs#clippy -c cargo clippy --bin zola

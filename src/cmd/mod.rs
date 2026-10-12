@@ -5,6 +5,7 @@ mod indexnow;
 mod init;
 mod serve;
 mod translate;
+mod translate_segments;
 
 pub use self::build::build;
 pub use self::check::check;
