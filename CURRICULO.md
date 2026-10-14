@@ -35,6 +35,10 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   and machine data are never sent: keys such as `canonical`, `source_url`,
   `jsonld`, `icon`, `id`, `slug`, `date`, `author`, any `*_url`/`*_id`/`*_hash`,
   and values that are URLs, paths, slugs or embedded JSON.
+- **Data keys are copied, not translated:** an `[extra]` string under a key
+  ending in `_key` (`review_complaints_key = "manatal"`) is a lookup into site
+  data. It is never sent to the model and is written exactly as in English. It
+  still counts toward `source_hash`, so this rule re-translates nothing.
 - **Sections:** `_index.md` is translated like a page. A file with neither a
   body nor `[extra]` copy (a title-only stub) is skipped.
 - **Freshness:** `source_hash` covers title, description, body and `[extra]`
@@ -47,7 +51,8 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   has (`noindex`, say) are kept.
 - **Structure never reaches the model:** a page is split into pieces. Block-level
   HTML, attributes, code fences, inline code, `{{ }}`/`{% %}` shortcodes, link
-  and image targets, URLs, entities, table pipes and list/heading markers are
+  and image targets, URLs, entities, table pipes, list/heading markers and
+  heading id blocks (`{#id}`, `{ #id }`, `{ #id .class }`) are
   *kept*: copied from the English source byte for byte. Only short prose
   segments (a paragraph line, a heading, a table cell, a `placeholder` /
   `aria-label` / `alt` / `title` value) are translated, so a bad translation can
@@ -71,6 +76,9 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   lowercase words, or five or more words in all; brand tokens, acronyms and
   names do not count). Empty output for a non-empty field, and a changed count
   of code fences, `{{`/`{%` shortcodes or `](` link targets, are rejected too.
+  So is a heading id that is dropped, added or changed (`{ #connect }` →
+  `{ # connecter }`: every `#connect` link breaks and `zola build` fails), and a
+  `*_key` value that differs from English.
 - **`--recheck`:** runs the same checks on siblings already stamped fresh and
   removes the stamp from those that fail, so the next run redoes them. Exits
   non-zero when it cleared anything.
