@@ -79,6 +79,9 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   So is a heading id that is dropped, added or changed (`{ #connect }` →
   `{ # connecter }`: every `#connect` link breaks and `zola build` fails), and a
   `*_key` value that differs from English.
+  Siblings written before these checks keep their fresh `source_hash`, so a
+  normal run skips them even when an id is already broken: run `--recheck`
+  once after upgrading (in a scratch copy, it writes), then translate.
 - **`--recheck`:** runs the same checks on siblings already stamped fresh and
   removes the stamp from those that fail, so the next run redoes them. Exits
   non-zero when it cleared anything.
