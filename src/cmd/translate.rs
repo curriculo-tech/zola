@@ -584,6 +584,9 @@ impl FieldDocs {
                 .extra
                 .iter()
                 .map(|(path, text)| {
+                    // An all-structure value (pure code fence) needs no case
+                    // here: `Doc::split` finds zero prose segments in it, so
+                    // it is already copied verbatim (see [`all_structure`]).
                     let doc =
                         if is_data_key(path) { Doc::verbatim(text) } else { Doc::split(text) };
                     (path.clone(), doc)
@@ -795,12 +798,16 @@ fn same_heading_ids(en: &str, t: &str) -> Result<()> {
     Ok(())
 }
 
-/// A data key is a lookup, not copy (see [`DATA_KEY_SUFFIX`]).
+/// A data key is a lookup, not copy (see [`DATA_KEY_SUFFIX`]); a value with no
+/// prose segments (a pure code fence, see [`all_structure`]) carries nothing a
+/// translation could change. Both are copied verbatim, so a sibling must keep
+/// them byte-identical to the English source.
 fn same_data_keys(en: &Translatable, t: &Translatable) -> Result<()> {
-    for (path, a) in en.extra.iter().filter(|(path, _)| is_data_key(path)) {
+    for (path, a) in en.extra.iter().filter(|(path, text)| is_data_key(path) || all_structure(text))
+    {
         let b = t.extra.iter().find(|(p, _)| p == path).map(|(_, text)| text);
         if b != Some(a) {
-            bail!("markup: data key extra.{path} changed in translation ({a:?} became {b:?})");
+            bail!("markup: verbatim extra.{path} changed in translation ({a:?} became {b:?})");
         }
     }
     Ok(())
@@ -961,6 +968,15 @@ pub(super) fn reads_as_prose(text: &str) -> bool {
     lower >= PASSTHROUGH_MIN_LOWER || all >= PASSTHROUGH_MIN_WORDS
 }
 
+/// True when the string has no prose segment at all: the splitter sees only
+/// structure (fenced code, markup, whitespace, URLs). Such a value never
+/// reaches a model — [`Doc::split`] yields zero segments, so [`FieldDocs`]
+/// copies it into the sibling byte-for-byte — and it is necessarily identical
+/// in every language, so "came back untranslated" cannot apply to it.
+pub(super) fn all_structure(text: &str) -> bool {
+    Doc::split(text).segments().next().is_none()
+}
+
 /// Post-check for clients without a per-text `ok` flag: a body or string that
 /// reads as prose (see [`reads_as_prose`]) and comes back byte-identical was
 /// not translated, and stamping it fresh would keep it English forever.
@@ -976,9 +992,15 @@ pub fn not_passthrough(en: &Translatable, t: &Translatable) -> Result<()> {
                 .map(|((path, a), (_, b))| (format!("extra.{path}"), a, b)),
         );
     for (field, source, translated) in pairs {
-        // A data key is copied as written on purpose (see `DATA_KEY_SUFFIX`).
-        let data_key = field.strip_prefix("extra.").is_some_and(is_data_key);
-        if !data_key && reads_as_prose(source) && source.trim() == translated.trim() {
+        // A data key is copied as written on purpose (see `DATA_KEY_SUFFIX`),
+        // and an `[extra]` value with no prose segments (a pure code fence) is
+        // identical across languages by construction (see [`all_structure`]):
+        // flagging either as a passthrough would clear the sibling on every
+        // recheck, forever.
+        let verbatim = field
+            .strip_prefix("extra.")
+            .is_some_and(|path| is_data_key(path) || all_structure(source));
+        if !verbatim && reads_as_prose(source) && source.trim() == translated.trim() {
             bail!("passthrough: {field} came back untranslated");
         }
     }
@@ -3437,5 +3459,48 @@ mod tests {
         assert!(same_data_keys(&en, &fr).is_err());
         fr.extra.pop();
         assert!(same_data_keys(&en, &fr).is_err(), "a missing data key is a change");
+    }
+
+    // ── pure-code [extra] values are verbatim, not passthroughs ───────
+
+    /// The shape that looped forever: an `[extra]` string that is 100% code.
+    const PURE_CODE: &str = "```bash\ncurl -X POST https://api.example.com/public/parse/ \\\n  -H 'Authorization: Bearer key_abc123_yoursecret' \\\n  -F 'files=@/path/to/candidate.pdf'\n```\n";
+
+    #[test]
+    fn pure_code_extra_value_is_not_an_untranslated_passthrough() {
+        assert!(all_structure(PURE_CODE), "a fenced block is all structure");
+        assert!(!all_structure("Run `curl` to parse a resume."), "prose stays checked");
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("hero_code".into(), PURE_CODE.into())];
+        let mut es = t("T", "", "Texto del cuerpo aquí.");
+        es.extra = en.extra.clone();
+        // Byte-identical is the only correct outcome, not a passthrough.
+        assert!(not_passthrough(&en, &es).is_ok());
+        assert!(markup_ok(&en, &es).is_ok());
+        // ...and equality with English is asserted, like a data key.
+        es.extra[0].1 = "```bash\necho changed\n```\n".into();
+        assert!(same_data_keys(&en, &es).is_err(), "a changed code value is a change");
+    }
+
+    #[test]
+    fn pure_code_extra_value_survives_translate_and_recheck() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        let fm = format!(
+            "title = \"Docs Curriculo\"\n[extra]\nhero_code = '''\n{PURE_CODE}'''\ntagline = \"Parse resumes over HTTP\"\n"
+        );
+        fx.write_page("content/docs/index.md", &fm, "Paste the snippet below.\n");
+        let mock = MockBatch::prefixing("ES ");
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        let sent: Vec<String> = mock.calls().into_iter().flat_map(|(t, _)| t).collect();
+        assert!(!sent.iter().any(|s| s.contains("curl")), "code went to the model: {sent:?}");
+        let es = fm_of(&fx, "content/docs/index.es.md");
+        assert_eq!(es["extra"]["hero_code"].as_str(), Some(PURE_CODE), "code must copy verbatim");
+        assert_eq!(es["extra"]["tagline"].as_str(), Some("ES Parse resumes over HTTP"));
+        // The sibling stays stamped: identical code is correct, so the
+        // recheck must not clear it (and re-translate it identically, and
+        // clear it again, forever).
+        assert!(recheck(fx.root(), &fx.config()).is_ok(), "recheck cleared a pure-code value");
+        assert!(fm_of(&fx, "content/docs/index.es.md")["extra"].get("source_hash").is_some());
     }
 }
