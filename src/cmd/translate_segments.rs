@@ -510,13 +510,15 @@ fn attr_text_re() -> &'static Regex {
     })
 }
 
-/// A heading attribute block: `{#id}`, `{ #id }`, `{ #id .class }`. Kept
-/// whole, so the id is never translated (`{ #connect }` → `{ # connecter }`
-/// broke every `#connect` link on curriculo.me, Oct 2026).
+/// A heading attribute block: `{#id}`, `{ #id }`, `{.class #id}`,
+/// `{#id key=value}`. Kept whole, so the id is never translated
+/// (`{ #connect }` → `{ # connecter }` broke every `#connect` link on
+/// curriculo.me, Oct 2026).
 fn anchor_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\{[ \t]*#[\w-]+(?:[ \t]+[.#][\w-]+)*[ \t]*\}").expect("anchor regex")
+        let attr = r#"(?:[#.][\w-]+|[\w-]+=(?:"[^"\n]*"|'[^'\n]*'|[^\s{}"']+))"#;
+        Regex::new(&format!(r"^\{{[ \t]*{attr}(?:[ \t]+{attr})*[ \t]*\}}")).expect("anchor regex")
     })
 }
 
@@ -1418,6 +1420,13 @@ mod tests {
             translate_upper(src),
             "## CONNECT A CLIENT { #connect }\n\n### ANALYTICS {#t-analytics}\n\n## TOOLS { #tools .wide }\n"
         );
+    }
+
+    #[test]
+    fn class_first_and_key_value_blocks_never_reach_the_model() {
+        let src = "## Tools {.wide #tools}\n\n## Jobs {#t-jobs data-nav=\"jobs\"}\n";
+        assert_eq!(texts(src), vec!["Tools", "Jobs"]);
+        assert_eq!(roundtrip(src), src);
     }
 
     #[test]

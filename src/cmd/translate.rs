@@ -739,17 +739,46 @@ pub fn markup_ok(en: &Translatable, t: &Translatable) -> Result<()> {
     same_data_keys(en, t)
 }
 
-/// `{ #id }` blocks outside fenced code, whitespace-normalised, in order. Also
-/// matches a translated `{ # outils }`, which the splitter would not keep.
+/// The attribute blocks (`{ #id }`, `{.class #id}`) of every markdown heading
+/// outside code blocks, each reduced to its tokens (`#id .class`) so spacing
+/// does not count. Also catches a translated `{ # outils }`, which the
+/// splitter would not keep. Only heading lines count: that is where an id
+/// becomes a link target.
 fn heading_ids(body: &str) -> Vec<String> {
-    static FENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let fence = FENCE.get_or_init(|| regex::Regex::new(r"(?s)```.*?```").expect("fence regex"));
-    let id = ID.get_or_init(|| regex::Regex::new(r"\{[ \t]*#[^{}\n]*\}").expect("id regex"));
-    let outside = fence.replace_all(body, "");
-    id.find_iter(&outside)
-        .map(|m| m.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
-        .collect()
+    static HEADING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TERA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heading =
+        HEADING.get_or_init(|| regex::Regex::new(r"^ {0,3}#{1,6}[ \t]").expect("heading regex"));
+    let block = BLOCK.get_or_init(|| regex::Regex::new(r"\{[^{}\n]*\}").expect("block regex"));
+    let tera = TERA.get_or_init(|| regex::Regex::new(r"\{\{.*?\}\}|\{%.*?%\}").expect("tera regex"));
+    let mut fence: Option<(char, usize)> = None;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let run = |c: char| trimmed.chars().take_while(|x| *x == c).count();
+        if let Some((c, n)) = fence {
+            if run(c) >= n && trimmed.trim_start_matches(c).trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(c) = ['`', '~'].into_iter().find(|c| run(*c) >= 3) {
+            fence = Some((c, run(c)));
+            continue;
+        }
+        if !heading.is_match(line) {
+            continue;
+        }
+        let line = tera.replace_all(line, "");
+        for m in block.find_iter(&line) {
+            let tokens: Vec<&str> = m.as_str()[1..m.as_str().len() - 1].split_whitespace().collect();
+            if tokens.iter().any(|t| t.starts_with(['#', '.']) || t.contains('=')) {
+                out.push(tokens.join(" "));
+            }
+        }
+    }
+    out
 }
 
 /// Heading ids are link targets: a dropped or translated one breaks every
@@ -768,8 +797,9 @@ fn same_heading_ids(en: &str, t: &str) -> Result<()> {
 
 /// A data key is a lookup, not copy (see [`DATA_KEY_SUFFIX`]).
 fn same_data_keys(en: &Translatable, t: &Translatable) -> Result<()> {
-    for ((path, a), (_, b)) in en.extra.iter().zip(&t.extra) {
-        if is_data_key(path) && a != b {
+    for (path, a) in en.extra.iter().filter(|(path, _)| is_data_key(path)) {
+        let b = t.extra.iter().find(|(p, _)| p == path).map(|(_, text)| text);
+        if b != Some(a) {
             bail!("markup: data key extra.{path} changed in translation ({a:?} became {b:?})");
         }
     }
@@ -946,7 +976,9 @@ pub fn not_passthrough(en: &Translatable, t: &Translatable) -> Result<()> {
                 .map(|((path, a), (_, b))| (format!("extra.{path}"), a, b)),
         );
     for (field, source, translated) in pairs {
-        if reads_as_prose(source) && source.trim() == translated.trim() {
+        // A data key is copied as written on purpose (see `DATA_KEY_SUFFIX`).
+        let data_key = field.strip_prefix("extra.").is_some_and(is_data_key);
+        if !data_key && reads_as_prose(source) && source.trim() == translated.trim() {
             bail!("passthrough: {field} came back untranslated");
         }
     }
@@ -3357,5 +3389,53 @@ mod tests {
         fx.write_page("content/mcp/index.es.md", &fm, broken);
         assert!(recheck(fx.root(), &fx.config()).is_err());
         assert!(!fx.page_body("content/mcp/index.es.md").contains("source_hash"));
+    }
+
+    // ── review of #36 ─────────────────────────────────────────────────
+
+    #[test]
+    fn heading_id_spacing_is_not_a_change() {
+        let en = t("T", "", "## Connect {#connect}\n\nText here.");
+        let fr = t("T", "", "## Connecter { #connect }\n\nTexte ici.");
+        assert!(markup_ok(&en, &fr).is_ok());
+    }
+
+    #[test]
+    fn class_first_and_key_value_attribute_blocks_are_checked() {
+        let en = t("T", "", "## Tools {.wide #tools}\n\nText here.");
+        assert!(markup_ok(&en, &t("T", "", "## Outils {.wide #tools}\n\nTexte ici.")).is_ok());
+        assert!(markup_ok(&en, &t("T", "", "## Outils {.wide #outils}\n\nTexte ici.")).is_err());
+        assert!(markup_ok(&en, &t("T", "", "## Outils\n\nTexte ici.")).is_err());
+    }
+
+    #[test]
+    fn heading_ids_ignore_every_kind_of_code_block() {
+        let body = "## Real { #real }\n\n~~~\n## Sample { #sample }\n~~~\n\n````md\n```\n## In { #in }\n```\n````\n";
+        assert_eq!(heading_ids(body), vec!["#real"]);
+        // Ids only count on heading lines: `{ #1 }` in prose is not one.
+        assert!(heading_ids("Item { #1 } in a sentence.\n").is_empty());
+    }
+
+    #[test]
+    fn prose_like_data_key_is_not_an_untranslated_passthrough() {
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("faq_key".into(), "pricing and billing questions".into())];
+        let mut fr = t("T", "", "Texte du corps ici.");
+        fr.extra = en.extra.clone();
+        assert!(not_passthrough(&en, &fr).is_ok());
+        assert!(markup_ok(&en, &fr).is_ok());
+    }
+
+    #[test]
+    fn data_keys_are_matched_by_path_not_position() {
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("a_key".into(), "one".into()), ("tagline".into(), "Fast hiring".into())];
+        let mut fr = t("T", "", "Texte ici.");
+        fr.extra = vec![("tagline".into(), "Recrutement rapide".into()), ("a_key".into(), "one".into())];
+        assert!(same_data_keys(&en, &fr).is_ok());
+        fr.extra[1].1 = "un".into();
+        assert!(same_data_keys(&en, &fr).is_err());
+        fr.extra.pop();
+        assert!(same_data_keys(&en, &fr).is_err(), "a missing data key is a change");
     }
 }
