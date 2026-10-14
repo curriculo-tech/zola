@@ -115,6 +115,17 @@ const EXTRA_SKIP_KEYS: &[&str] = &[
 /// Key suffixes with the same meaning as [`EXTRA_SKIP_KEYS`].
 const EXTRA_SKIP_SUFFIXES: &[&str] =
     &["_url", "_href", "_src", "_path", "_id", "_icon", "_class", "_image", "_img", "_hash"];
+/// `[extra]` keys whose value is a lookup key into site data
+/// (`review_complaints_key = "manatal"`): copied verbatim, never translated,
+/// and checked unchanged. Not in [`EXTRA_SKIP_SUFFIXES`] on purpose: they stay
+/// in [`source_hash`], so adding this rule re-translates no existing sibling.
+const DATA_KEY_SUFFIX: &str = "_key";
+
+/// True when the `[extra]` leaf at `path` (`a.b[2].c`) is a data key.
+fn is_data_key(path: &str) -> bool {
+    let last = path.rsplit('.').next().unwrap_or(path);
+    last.split('[').next().unwrap_or(last).ends_with(DATA_KEY_SUFFIX)
+}
 
 /// LLM translation client. A trait so unit tests inject a mock without a network.
 pub trait LlmClient {
@@ -569,7 +580,15 @@ impl FieldDocs {
         Self {
             title: Doc::split(&t.title),
             description: Doc::split(&t.description),
-            extra: t.extra.iter().map(|(path, text)| (path.clone(), Doc::split(text))).collect(),
+            extra: t
+                .extra
+                .iter()
+                .map(|(path, text)| {
+                    let doc =
+                        if is_data_key(path) { Doc::verbatim(text) } else { Doc::split(text) };
+                    (path.clone(), doc)
+                })
+                .collect(),
             body: Doc::split_markdown(&t.body),
         }
     }
@@ -715,7 +734,76 @@ pub fn markup_ok(en: &Translatable, t: &Translatable) -> Result<()> {
     }
     no_leftover_placeholders(&en_blob, &t_blob)?;
     same_attribute_values(&en_blob, &t_blob)?;
-    same_code_spans(&en_blob, &t_blob)
+    same_code_spans(&en_blob, &t_blob)?;
+    same_heading_ids(&en.body, &t.body)?;
+    same_data_keys(en, t)
+}
+
+/// The attribute blocks (`{ #id }`, `{.class #id}`) of every markdown heading
+/// outside code blocks, each reduced to its tokens (`#id .class`) so spacing
+/// does not count. Also catches a translated `{ # outils }`, which the
+/// splitter would not keep. Only heading lines count: that is where an id
+/// becomes a link target.
+fn heading_ids(body: &str) -> Vec<String> {
+    static HEADING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TERA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heading =
+        HEADING.get_or_init(|| regex::Regex::new(r"^ {0,3}#{1,6}[ \t]").expect("heading regex"));
+    let block = BLOCK.get_or_init(|| regex::Regex::new(r"\{[^{}\n]*\}").expect("block regex"));
+    let tera = TERA.get_or_init(|| regex::Regex::new(r"\{\{.*?\}\}|\{%.*?%\}").expect("tera regex"));
+    let mut fence: Option<(char, usize)> = None;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let run = |c: char| trimmed.chars().take_while(|x| *x == c).count();
+        if let Some((c, n)) = fence {
+            if run(c) >= n && trimmed.trim_start_matches(c).trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(c) = ['`', '~'].into_iter().find(|c| run(*c) >= 3) {
+            fence = Some((c, run(c)));
+            continue;
+        }
+        if !heading.is_match(line) {
+            continue;
+        }
+        let line = tera.replace_all(line, "");
+        for m in block.find_iter(&line) {
+            let tokens: Vec<&str> = m.as_str()[1..m.as_str().len() - 1].split_whitespace().collect();
+            if tokens.iter().any(|t| t.starts_with(['#', '.']) || t.contains('=')) {
+                out.push(tokens.join(" "));
+            }
+        }
+    }
+    out
+}
+
+/// Heading ids are link targets: a dropped or translated one breaks every
+/// `#id` link to it, and `zola build` fails on the dangling anchor.
+fn same_heading_ids(en: &str, t: &str) -> Result<()> {
+    let (a, b) = (heading_ids(en), heading_ids(t));
+    if a != b {
+        bail!(
+            "markup: heading ids changed in translation: [{}] became [{}]",
+            a.join(" "),
+            b.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// A data key is a lookup, not copy (see [`DATA_KEY_SUFFIX`]).
+fn same_data_keys(en: &Translatable, t: &Translatable) -> Result<()> {
+    for (path, a) in en.extra.iter().filter(|(path, _)| is_data_key(path)) {
+        let b = t.extra.iter().find(|(p, _)| p == path).map(|(_, text)| text);
+        if b != Some(a) {
+            bail!("markup: data key extra.{path} changed in translation ({a:?} became {b:?})");
+        }
+    }
+    Ok(())
 }
 
 fn sentinel_re() -> &'static regex::Regex {
@@ -888,7 +976,9 @@ pub fn not_passthrough(en: &Translatable, t: &Translatable) -> Result<()> {
                 .map(|((path, a), (_, b))| (format!("extra.{path}"), a, b)),
         );
     for (field, source, translated) in pairs {
-        if reads_as_prose(source) && source.trim() == translated.trim() {
+        // A data key is copied as written on purpose (see `DATA_KEY_SUFFIX`).
+        let data_key = field.strip_prefix("extra.").is_some_and(is_data_key);
+        if !data_key && reads_as_prose(source) && source.trim() == translated.trim() {
             bail!("passthrough: {field} came back untranslated");
         }
     }
@@ -3215,5 +3305,137 @@ mod tests {
         assert!(es.get("aliases").is_none(), "an alias is an English URL, it would collide");
         let fr = fm_of(&fx, "content/eng-root/index.fr.md");
         assert_eq!(fr["path"].as_str(), Some("/fr/engineering/root/"));
+    }
+
+    // ── heading ids and data keys survive translation ─────────────────
+
+    #[test]
+    fn markup_rejects_a_dropped_or_translated_heading_id() {
+        let en = t("T", "", "## Connect a client { #connect }\n\nText here.");
+        let good = t("T", "", "## Connectez un client { #connect }\n\nTexte ici.");
+        assert!(markup_ok(&en, &good).is_ok());
+        let dropped = t("T", "", "## Connectez un client\n\nTexte ici.");
+        let err = markup_ok(&en, &dropped).unwrap_err().to_string();
+        assert!(err.contains("heading ids"), "{err}");
+        let translated = t("T", "", "## Connectez un client { # connecter }\n\nTexte ici.");
+        assert!(markup_ok(&en, &translated).is_err());
+        // #315 left the translated id next to the restored one: still wrong.
+        let doubled =
+            t("T", "", "## Connectez un client { # connecter } { #connect }\n\nTexte ici.");
+        assert!(markup_ok(&en, &doubled).is_err());
+    }
+
+    #[test]
+    fn data_key_leaves_are_copied_not_translated() {
+        let en = Translatable {
+            title: "Manatal".into(),
+            extra: vec![
+                ("review_complaints_key".into(), "manatal".into()),
+                ("tagline".into(), "Recruiting software for agencies".into()),
+            ],
+            ..Translatable::default()
+        };
+        let docs = FieldDocs::split(&en);
+        let sent: Vec<String> = docs.segments().map(|s| s.source()).collect();
+        assert!(!sent.iter().any(|s| s == "manatal"), "a data key went to the model: {sent:?}");
+        let rendered = docs.render(&sent.iter().map(|s| format!("X {s}")).collect::<Vec<_>>());
+        assert_eq!(rendered.extra[0], ("review_complaints_key".to_string(), "manatal".to_string()));
+        assert_eq!(rendered.extra[1].1, "X Recruiting software for agencies");
+    }
+
+    #[test]
+    fn markup_rejects_a_changed_data_key() {
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("review_complaints_key".into(), "manatal".into())];
+        let mut ja = t("T", "", "本文です。");
+        ja.extra = vec![("review_complaints_key".into(), "マナタル".into())];
+        let err = markup_ok(&en, &ja).unwrap_err().to_string();
+        assert!(err.contains("review_complaints_key"), "{err}");
+        ja.extra[0].1 = "manatal".into();
+        assert!(markup_ok(&en, &ja).is_ok());
+    }
+
+    #[test]
+    fn endpoint_run_keeps_ids_and_keys_verbatim_and_hash_unchanged() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        let fm = "title = \"Manatal\"\n[extra]\nreview_complaints_key = \"manatal\"\n";
+        let body = "## Connect a client { #connect }\n\nPaste the config below.\n";
+        fx.write_page("content/manatal/index.md", fm, body);
+        // The hash must not move: a new hash re-translates every sibling.
+        let (en_fm, en_body) = parse_page(&fx.root().join("content/manatal/index.md")).unwrap();
+        let en = page_source(&en_fm, &en_body);
+        assert_eq!(en.extra, vec![("review_complaints_key".to_string(), "manatal".to_string())]);
+        let mock = MockBatch::prefixing("ES ");
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        let sent: Vec<String> = mock.calls().into_iter().flat_map(|(t, _)| t).collect();
+        assert!(!sent.iter().any(|s| s.contains("connect") || s == "manatal"), "{sent:?}");
+        let out = fx.page_body("content/manatal/index.es.md");
+        assert!(out.contains("## ES Connect a client { #connect }"), "{out}");
+        assert!(out.contains("review_complaints_key = \"manatal\""), "{out}");
+        assert!(out.contains(&source_hash(&en)), "{out}");
+    }
+
+    #[test]
+    fn recheck_clears_a_sibling_with_a_translated_id() {
+        let fx = Fixture::new();
+        one_lang_config(&fx);
+        let body = "## Tools reference { #tools }\n\nEvery tool listed here.\n";
+        fx.write_page("content/mcp/index.md", "title = \"MCP\"\n", body);
+        let en = page_source(&toml::from_str("title = \"MCP\"").unwrap(), body);
+        let fm = format!("title = \"MCP\"\n[extra]\nsource_hash = \"{}\"\n", source_hash(&en));
+        let broken =
+            "## Résumé des outils { # outils } { #tools }\n\nChaque outil est listé ici.\n";
+        fx.write_page("content/mcp/index.es.md", &fm, broken);
+        assert!(recheck(fx.root(), &fx.config()).is_err());
+        assert!(!fx.page_body("content/mcp/index.es.md").contains("source_hash"));
+    }
+
+    // ── review of #36 ─────────────────────────────────────────────────
+
+    #[test]
+    fn heading_id_spacing_is_not_a_change() {
+        let en = t("T", "", "## Connect {#connect}\n\nText here.");
+        let fr = t("T", "", "## Connecter { #connect }\n\nTexte ici.");
+        assert!(markup_ok(&en, &fr).is_ok());
+    }
+
+    #[test]
+    fn class_first_and_key_value_attribute_blocks_are_checked() {
+        let en = t("T", "", "## Tools {.wide #tools}\n\nText here.");
+        assert!(markup_ok(&en, &t("T", "", "## Outils {.wide #tools}\n\nTexte ici.")).is_ok());
+        assert!(markup_ok(&en, &t("T", "", "## Outils {.wide #outils}\n\nTexte ici.")).is_err());
+        assert!(markup_ok(&en, &t("T", "", "## Outils\n\nTexte ici.")).is_err());
+    }
+
+    #[test]
+    fn heading_ids_ignore_every_kind_of_code_block() {
+        let body = "## Real { #real }\n\n~~~\n## Sample { #sample }\n~~~\n\n````md\n```\n## In { #in }\n```\n````\n";
+        assert_eq!(heading_ids(body), vec!["#real"]);
+        // Ids only count on heading lines: `{ #1 }` in prose is not one.
+        assert!(heading_ids("Item { #1 } in a sentence.\n").is_empty());
+    }
+
+    #[test]
+    fn prose_like_data_key_is_not_an_untranslated_passthrough() {
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("faq_key".into(), "pricing and billing questions".into())];
+        let mut fr = t("T", "", "Texte du corps ici.");
+        fr.extra = en.extra.clone();
+        assert!(not_passthrough(&en, &fr).is_ok());
+        assert!(markup_ok(&en, &fr).is_ok());
+    }
+
+    #[test]
+    fn data_keys_are_matched_by_path_not_position() {
+        let mut en = t("T", "", "Body text here.");
+        en.extra = vec![("a_key".into(), "one".into()), ("tagline".into(), "Fast hiring".into())];
+        let mut fr = t("T", "", "Texte ici.");
+        fr.extra = vec![("tagline".into(), "Recrutement rapide".into()), ("a_key".into(), "one".into())];
+        assert!(same_data_keys(&en, &fr).is_ok());
+        fr.extra[1].1 = "un".into();
+        assert!(same_data_keys(&en, &fr).is_err());
+        fr.extra.pop();
+        assert!(same_data_keys(&en, &fr).is_err(), "a missing data key is a change");
     }
 }

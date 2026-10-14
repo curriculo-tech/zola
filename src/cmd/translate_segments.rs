@@ -67,6 +67,11 @@ impl Doc {
         Self { pieces: Splitter::new(true).run(text) }
     }
 
+    /// A string copied through unchanged: no segment goes to the model.
+    pub fn verbatim(text: &str) -> Self {
+        Self { pieces: vec![Piece::Keep(text.to_string())] }
+    }
+
     pub fn segments(&self) -> impl Iterator<Item = &Segment> {
         self.pieces.iter().filter_map(|p| match p {
             Piece::Text(s) => Some(s),
@@ -505,9 +510,16 @@ fn attr_text_re() -> &'static Regex {
     })
 }
 
+/// A heading attribute block: `{#id}`, `{ #id }`, `{.class #id}`,
+/// `{#id key=value}`. Kept whole, so the id is never translated
+/// (`{ #connect }` → `{ # connecter }` broke every `#connect` link on
+/// curriculo.me, Oct 2026).
 fn anchor_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\{#[\w-]+\}").expect("anchor regex"))
+    RE.get_or_init(|| {
+        let attr = r#"(?:[#.][\w-]+|[\w-]+=(?:"[^"\n]*"|'[^'\n]*'|[^\s{}"']+))"#;
+        Regex::new(&format!(r"^\{{[ \t]*{attr}(?:[ \t]+{attr})*[ \t]*\}}")).expect("anchor regex")
+    })
 }
 
 fn autolink_re() -> &'static Regex {
@@ -1395,6 +1407,31 @@ mod tests {
             texts(src),
             vec!["Why teams switch", "Faster screening", "Clear scoring", "Quoted advice here"]
         );
+    }
+
+    #[test]
+    fn heading_ids_never_reach_the_model() {
+        // landing-website writes `{ #id }` with spaces; the Oct 2-13 drains
+        // translated or dropped those ids and broke `#connect` links.
+        let src = "## Connect a client { #connect }\n\n### Analytics {#t-analytics}\n\n## Tools { #tools .wide }\n";
+        assert_eq!(texts(src), vec!["Connect a client", "Analytics", "Tools"]);
+        assert_eq!(roundtrip(src), src);
+        assert_eq!(
+            translate_upper(src),
+            "## CONNECT A CLIENT { #connect }\n\n### ANALYTICS {#t-analytics}\n\n## TOOLS { #tools .wide }\n"
+        );
+    }
+
+    #[test]
+    fn class_first_and_key_value_blocks_never_reach_the_model() {
+        let src = "## Tools {.wide #tools}\n\n## Jobs {#t-jobs data-nav=\"jobs\"}\n";
+        assert_eq!(texts(src), vec!["Tools", "Jobs"]);
+        assert_eq!(roundtrip(src), src);
+    }
+
+    #[test]
+    fn braces_that_are_not_an_id_stay_prose() {
+        assert_eq!(texts("Use { and } freely.\n"), vec!["Use { and } freely."]);
     }
 
     #[test]
