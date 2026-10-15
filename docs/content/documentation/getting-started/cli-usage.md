@@ -136,7 +136,13 @@ Requires `OPENROUTER_API_KEY`. Hash-gated so fresh siblings are skipped.
 $ zola translate
 $ zola translate --max 60
 $ zola translate --dry-run
+$ zola translate --langs sw,tl,ig   # override config.toml [languages]
 ```
+
+By default the target languages are the `[languages]` sections of
+`config.toml`. `--langs` replaces that list for the run — any language code
+the backend accepts works (with `TRANSLATE_URL` set, the local endpoint
+serves 200+ targets), so a full drain is not limited to configured sections.
 
 ## graph (Curriculo fork)
 

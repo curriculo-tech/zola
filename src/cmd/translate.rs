@@ -2,11 +2,13 @@
 //! self-hosted batch endpoint.
 //!
 //! For each default-language page or section that has a body or `[extra]` copy,
-//! for each non-default language in config.toml: the sibling `<slug>.<lang>.md`
-//! is *fresh* iff its `extra.source_hash` equals sha256 of the default page's
-//! translatable fields (title, description, body, `[extra]` copy leaves, see
-//! [`extra_copy_leaves`]). Output that changes the HTML tags or comes back
-//! untranslated is never written. Missing/stale siblings are (re)generated through
+//! for each non-default language in config.toml — or the `--langs` override,
+//! which accepts any code the backend takes (the local endpoint serves 200+):
+//! the sibling `<slug>.<lang>.md` is *fresh* iff its `extra.source_hash` equals
+//! sha256 of the default page's translatable fields (title, description, body,
+//! `[extra]` copy leaves, see [`extra_copy_leaves`]). Output that changes the
+//! HTML tags or comes back untranslated is never written. Missing/stale
+//! siblings are (re)generated through
 //! OpenRouter, written with `extra.source_hash` set, and brand-token-gated
 //! (INV-5: a glossary token present in the source must survive verbatim, else
 //! the file is NOT written and counts as a failure).
@@ -29,7 +31,7 @@
 //! same order. Fields are the Zola page set {title, description, body} plus
 //! `[extra]` copy.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,18 +61,28 @@ const BATCH_MAX_TEXTS: usize = 128;
 const BATCH_MAX_TEXT_BYTES: usize = 16 * 1024;
 const FM_DELIM: &str = "+++";
 
-/// Target language code → human name for the system prompt.
-fn lang_name(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "es" => "Spanish",
-        "pt" => "Portuguese",
-        "zh" => "Chinese (Simplified)",
-        "ko" => "Korean",
-        "ja" => "Japanese",
-        "fr" => "French",
-        "ar" => "Arabic",
-        _ => return None,
-    })
+/// Target language code → human name for the system prompt. Unknown codes
+/// fall back to the code itself — gpt-4o-mini reads ISO codes fine, and the
+/// endpoint path ([`TranslateApiClient`]) takes codes directly, so no code is
+/// ever rejected for lacking a name here.
+///
+/// # Pre-condition
+/// `code` must be non-empty: an empty code would yield "translate into "
+/// with no language in the system prompt. Codes arrive via [`resolve_langs`],
+/// which filters empties, so the invariant holds by construction;
+/// `debug_assert` catches misuse in debug builds.
+fn lang_name(code: &str) -> String {
+    debug_assert!(!code.is_empty(), "lang_name: code must be non-empty");
+    match code {
+        "es" => "Spanish".to_string(),
+        "pt" => "Portuguese".to_string(),
+        "zh" => "Chinese (Simplified)".to_string(),
+        "ko" => "Korean".to_string(),
+        "ja" => "Japanese".to_string(),
+        "fr" => "French".to_string(),
+        "ar" => "Arabic".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Translatable fields of a default-language page.
@@ -418,8 +430,7 @@ fn openrouter_translate_texts(
 ) -> Result<Vec<String>> {
     // Any code works: a language outside the named set is described by its code,
     // so adding a language to config.toml is enough to translate into it.
-    let name =
-        lang_name(lang).map(str::to_string).unwrap_or_else(|| format!("the language {lang}"));
+    let name = lang_name(lang);
     let system = format!(
         "You translate marketing web copy into {name}. You receive a JSON object {{\"texts\": [...]}}. \
         Translate every string. Return a JSON object {{\"texts\": [...]}} with exactly as many strings \
@@ -1154,6 +1165,7 @@ pub fn translate(
     config_file: &Path,
     max: Option<usize>,
     dry_run: bool,
+    langs: Option<Vec<String>>,
 ) -> Result<()> {
     if let Some(url) = env::var("TRANSLATE_URL").ok().filter(|s| !s.is_empty()) {
         let timeout = timeout_from_env()?;
@@ -1163,7 +1175,14 @@ pub fn translate(
             preserve_terms.len()
         );
         let client = TranslateApiClient::new(url, timeout, preserve_terms)?;
-        return translate_with_endpoint(root_dir, config_file, max, dry_run, &client);
+        return translate_with_endpoint(
+            root_dir,
+            config_file,
+            max,
+            dry_run,
+            langs.as_deref(),
+            &client,
+        );
     }
     let key = if dry_run {
         String::new()
@@ -1173,7 +1192,15 @@ pub fn translate(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("OPENROUTER_API_KEY not set — translate needs it"))?
     };
-    translate_with(root_dir, config_file, max, dry_run, &key, &OpenRouterClient::new()?)
+    translate_with(
+        root_dir,
+        config_file,
+        max,
+        dry_run,
+        langs.as_deref(),
+        &key,
+        &OpenRouterClient::new()?,
+    )
 }
 
 /// Testable core; takes the key and LLM client as parameters so tests inject a
@@ -1183,15 +1210,23 @@ pub fn translate_with<C: LlmClient>(
     config_file: &Path,
     max: Option<usize>,
     dry_run: bool,
+    langs_override: Option<&[String]>,
     key: &str,
     client: &C,
 ) -> Result<()> {
-    let (_default_lang, langs) = read_langs(config_file)?;
+    let (default_lang, config_langs) = read_langs(config_file)?;
+    let langs = resolve_langs(&default_lang, &config_langs, langs_override)?;
     if langs.is_empty() {
         log::info!("translate: no non-default languages configured; nothing to do");
         return Ok(());
     }
-    let lang_set: HashSet<&str> = langs.iter().map(|s| s.as_str()).collect();
+    // A page wearing ANY known language suffix is a translation, not a source:
+    // with --langs the drain set and the config set differ, and both kinds of
+    // sibling must stay excluded (else `index.es.md` would itself get an
+    // `index.es.de.md`). HashSet: one lookup per page instead of a per-lang
+    // ends_with scan — the set reaches 200+ codes on full drains.
+    let mut lang_set: HashSet<&str> = langs.iter().map(|s| s.as_str()).collect();
+    lang_set.extend(config_langs.iter().map(|s| s.as_str()));
 
     let content_dir = root_dir.join("content");
     let mut pages: Vec<PathBuf> = Vec::new();
@@ -1346,14 +1381,18 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
     config_file: &Path,
     max: Option<usize>,
     dry_run: bool,
+    langs_override: Option<&[String]>,
     client: &C,
 ) -> Result<()> {
-    let (_default_lang, langs) = read_langs(config_file)?;
+    let (default_lang, config_langs) = read_langs(config_file)?;
+    let langs = resolve_langs(&default_lang, &config_langs, langs_override)?;
     if langs.is_empty() {
         log::info!("translate: no non-default languages configured; nothing to do");
         return Ok(());
     }
-    let lang_set: HashSet<&str> = langs.iter().map(|s| s.as_str()).collect();
+    // Same union + lookup rationale as translate_with: 200-code drain sets.
+    let mut lang_set: HashSet<&str> = langs.iter().map(|s| s.as_str()).collect();
+    lang_set.extend(config_langs.iter().map(|s| s.as_str()));
 
     let content_dir = root_dir.join("content");
     let mut pages: Vec<PathBuf> = Vec::new();
@@ -1423,9 +1462,18 @@ fn translate_with_endpoint<C: BatchTranslateClient>(
     let mut written = 0usize;
 
     // One language at a time: drain all of a language's jobs before the next,
-    // so a partial run leaves whole languages consistent.
-    for lang in &langs {
-        let lang_jobs: Vec<&BatchJob> = jobs.iter().filter(|j| j.lang == *lang).collect();
+    // so a partial run leaves whole languages consistent. Jobs are grouped
+    // once (O(jobs)) rather than re-filtered per language — a 200-lang drain
+    // over pages×200 jobs would otherwise scan the whole list 200 times.
+    let mut by_lang: Vec<Vec<usize>> = vec![Vec::new(); langs.len()];
+    let lang_index: HashMap<&str, usize> =
+        langs.iter().enumerate().map(|(i, lang)| (lang.as_str(), i)).collect();
+    for (ji, job) in jobs.iter().enumerate() {
+        let li = *lang_index.get(job.lang.as_str()).expect("job lang is from langs");
+        by_lang[li].push(ji);
+    }
+    for (li, lang) in langs.iter().enumerate() {
+        let lang_jobs: Vec<&BatchJob> = by_lang[li].iter().map(|&ji| &jobs[ji]).collect();
         if lang_jobs.is_empty() {
             continue;
         }
@@ -1732,6 +1780,31 @@ fn read_langs(config_file: &Path) -> Result<(String, Vec<String>)> {
     Ok((default, langs))
 }
 
+/// Effective target list: the `--langs` override when given (trimmed,
+/// de-duplicated, sorted, default language dropped), else the config list.
+/// An override that parses to nothing usable is a user error, not a no-op —
+/// silently falling back to config would translate the wrong languages.
+fn resolve_langs(
+    default: &str,
+    config_langs: &[String],
+    langs_override: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let Some(override_list) = langs_override else {
+        return Ok(config_langs.to_vec());
+    };
+    let mut langs: Vec<String> = override_list
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != default)
+        .collect();
+    langs.sort();
+    langs.dedup();
+    if langs.is_empty() {
+        bail!("--langs parsed to no usable language codes (got {:?})", override_list);
+    }
+    Ok(langs)
+}
+
 pub(super) fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let rd = match fs::read_dir(dir) {
         Ok(r) => r,
@@ -1756,7 +1829,10 @@ fn is_default_page(file_name: &str, lang_set: &HashSet<&str>) -> bool {
     let Some(stem) = file_name.strip_suffix(".md") else {
         return false;
     };
-    !lang_set.iter().any(|l| stem.ends_with(&format!(".{l}")))
+    // The language code is the last dot-segment (`index.es.md` → `es`): one
+    // set lookup instead of a per-lang `ends_with(format!(".{l}"))` scan, so a
+    // 200+ code set costs the same as a two-code one.
+    !stem.rsplit_once('.').is_some_and(|(_, code)| lang_set.contains(code))
 }
 
 /// The translatable fields of a default-language page.
@@ -2219,7 +2295,7 @@ mod tests {
             json!({"ok": false, "translations": vec!["passthrough"; n]}).to_string()
         });
         let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &client);
+        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &client);
         assert!(res.is_err(), "ok:false must surface as a failure");
         assert!(!fx.root().join("content/post/index.es.md").exists(), "must not write es");
         assert!(!fx.root().join("content/post/index.fr.md").exists(), "must not write fr");
@@ -2234,7 +2310,7 @@ mod tests {
             json!({"code": 1003, "translations": vec!["passthrough"; n]}).to_string()
         });
         let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &client);
+        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &client);
         assert!(res.is_err(), "mirrored error code 1003 must surface as a failure");
         assert!(!fx.root().join("content/post/index.es.md").exists(), "must not write es");
         assert!(!fx.root().join("content/post/index.fr.md").exists(), "must not write fr");
@@ -2261,7 +2337,7 @@ mod tests {
             .to_string()
         });
         let client = TranslateApiClient::new(&server.url, Duration::from_secs(30), vec![]).unwrap();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &client).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &client).unwrap();
         let reqs = server.reqs.load(Ordering::SeqCst);
         let conns = server.conns.load(Ordering::SeqCst);
         assert!(reqs > 2, "expected several batched requests, got {reqs}");
@@ -2355,7 +2431,7 @@ mod tests {
             );
         }
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let calls = mock.calls();
         assert_eq!(calls.len(), 2, "5 pages under a 4-page cap ⇒ 2 requests");
         assert_eq!(calls[0].1, "es");
@@ -2389,7 +2465,7 @@ mod tests {
             );
         }
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let calls = mock.calls();
         assert_eq!(calls.len(), 2, "expected the 2+1 page split");
         for (texts, lang) in &calls {
@@ -2421,7 +2497,7 @@ mod tests {
             .join("\n\n");
         fx.write_page("content/post/index.md", "title = \"T\"\ndescription = \"D\"\n", &body);
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let calls = mock.calls();
         assert!(calls.len() >= 2, "over-cap page must span batches, got {}", calls.len());
         let sibling = fx.root().join("content/post/index.es.md");
@@ -2448,7 +2524,7 @@ mod tests {
             );
         }
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         // 5 pages > the 4-page cap ⇒ 2 requests per language; all of es first.
         assert_eq!(mock.langs(), vec!["es", "es", "fr", "fr"]);
     }
@@ -2460,7 +2536,7 @@ mod tests {
         fx.write_page("content/post/index.md", "title = \"T\"\ndescription = \"D\"\n", "Body.\n");
         let mock = MockBatch::new();
         mock.push_ok_flags(vec![("t-es", true), ("d-es", true), ("b-es", true)]);
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         // One call: title → description → body, in field order.
         assert_eq!(mock.texts_of(0), ["T", "D", "Body."]);
         let (fm, body) = parse_page(&fx.root().join("content/post/index.es.md")).unwrap();
@@ -2499,7 +2575,7 @@ mod tests {
             ("x10", true),
             ("x11", true),
         ]);
-        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock);
+        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock);
         let err = res.unwrap_err().to_string();
         assert!(err.contains("failure"), "got: {err}");
         // Page 2: no file (which also means no source_hash stamp). Pages
@@ -2542,7 +2618,7 @@ mod tests {
         let mock = MockBatch::new();
         mock.push_err("translate endpoint reported ok:false — source text returned untranslated");
         // Batch 2 falls through to the echo default and writes pages 4-5.
-        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock);
+        let res = translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock);
         assert!(res.is_err(), "3 failed jobs must fail the run");
         for i in 1..=3 {
             assert!(
@@ -2572,7 +2648,7 @@ mod tests {
         // Jobs are page-major (p1-es, p1-fr, p2-es, p2-fr); --max 1 keeps the
         // first only — the same cut translate_with makes per (page, lang).
         let m1 = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), Some(1), false, &m1).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), Some(1), false, None, &m1).unwrap();
         assert_eq!(m1.calls().len(), 1);
         assert_eq!(m1.calls()[0].1, "es");
         assert_eq!(m1.texts_of(0), ["P1", "Body 1."]);
@@ -2583,7 +2659,7 @@ mod tests {
 
         // Resume: exactly the 3 remaining jobs translate; es drained before fr.
         let m2 = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &m2).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &m2).unwrap();
         assert_eq!(m2.langs(), vec!["es", "fr"], "es (only p2 left) before fr (p1, p2)");
         for p in ["content/p1/index.fr.md", "content/p2/index.es.md", "content/p2/index.fr.md"] {
             assert!(fx.root().join(p).exists(), "{p} must be written on resume");
@@ -2595,7 +2671,7 @@ mod tests {
         let fx = Fixture::new();
         fx.write_page("content/post/index.md", en_page_fm(), "Body one.\n");
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, true, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, true, None, &mock).unwrap();
         assert!(mock.calls().is_empty(), "dry-run must not hit the endpoint");
         assert!(!fx.root().join("content/post/index.es.md").exists());
         assert!(!fx.root().join("content/post/index.fr.md").exists());
@@ -2616,7 +2692,7 @@ mod tests {
         write_sibling(&fx.root().join("content/post/index.es.md"), &fm, &en, &source_hash(&en))
             .unwrap();
         let mock = MockBatch::new();
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let calls = mock.calls();
         assert_eq!(calls.len(), 1, "only fr remains");
         assert_eq!(calls[0].1, "fr");
@@ -2673,7 +2749,7 @@ mod tests {
 
         let c = EchoClient { calls: Cell::new(0) };
         // run 1: both langs stale → 2 calls, both written
-        translate_with(fx.root(), &fx.config(), None, false, "test-key", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &c).unwrap();
         assert_eq!(c.calls.get(), 2);
         let es = fx.page_body("content/post/index.es.md");
         assert!(es.contains("[es] Hello Curriculo"));
@@ -2681,12 +2757,12 @@ mod tests {
         assert!(es.contains("Curriculo")); // brand preserved by EchoClient
 
         // run 2: source unchanged → both fresh → no calls
-        translate_with(fx.root(), &fx.config(), None, false, "test-key", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &c).unwrap();
         assert_eq!(c.calls.get(), 2, "fresh siblings must not re-translate");
 
         // mutate en body → both stale → 2 more calls
         fx.write_page("content/post/index.md", en_page_fm(), "Body two.\n");
-        translate_with(fx.root(), &fx.config(), None, false, "test-key", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &c).unwrap();
         assert_eq!(c.calls.get(), 4, "stale siblings must regenerate");
     }
 
@@ -2695,7 +2771,8 @@ mod tests {
         let fx = Fixture::new();
         fx.write_page("content/post/index.md", en_page_fm(), "Curriculo body.\n");
 
-        let res = translate_with(fx.root(), &fx.config(), None, false, "test-key", &DroppingClient);
+        let res =
+            translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &DroppingClient);
         assert!(res.is_err(), "glossary failure must surface as non-zero exit");
         assert!(!fx.root().join("content/post/index.es.md").exists(), "file must NOT be written");
         assert!(!fx.root().join("content/post/index.fr.md").exists());
@@ -2708,7 +2785,7 @@ mod tests {
 
         // cap at 1 call: only one of {es, fr} translated
         let c1 = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), Some(1), false, "test-key", &c1).unwrap();
+        translate_with(fx.root(), &fx.config(), Some(1), false, None, "test-key", &c1).unwrap();
         assert_eq!(c1.calls.get(), 1);
         let one_written = fx.root().join("content/post/index.es.md").exists()
             ^ fx.root().join("content/post/index.fr.md").exists();
@@ -2716,7 +2793,7 @@ mod tests {
 
         // resume: the remaining lang is still missing → translated now
         let c2 = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "test-key", &c2).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &c2).unwrap();
         assert_eq!(c2.calls.get(), 1, "only the previously-capped lang remains");
         assert!(fx.root().join("content/post/index.es.md").exists());
         assert!(fx.root().join("content/post/index.fr.md").exists());
@@ -2726,7 +2803,8 @@ mod tests {
     fn non_zero_exit_on_failures() {
         let fx = Fixture::new();
         fx.write_page("content/post/index.md", en_page_fm(), "Body.\n");
-        let res = translate_with(fx.root(), &fx.config(), None, false, "test-key", &FailClient);
+        let res =
+            translate_with(fx.root(), &fx.config(), None, false, None, "test-key", &FailClient);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("failure"));
     }
@@ -2738,7 +2816,7 @@ mod tests {
         fx.write_page("content/stub/index.md", "title = \"Stub\"\n", "\n");
         let c = EchoClient { calls: Cell::new(0) };
         // dry_run, no key in env for this process slice: must NOT error
-        translate_with(fx.root(), &fx.config(), None, true, "test-key", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, true, None, "test-key", &c).unwrap();
         assert_eq!(c.calls.get(), 0);
         assert!(!fx.root().join("content/stub/index.es.md").exists());
     }
@@ -2798,7 +2876,7 @@ mod tests {
         one_lang_config(&fx);
         fx.write_page("content/home/index.md", extra_fm(), "Body Curriculo.\n");
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
 
         let es = fm_of(&fx, "content/home/index.es.md");
         let extra = &es["extra"];
@@ -2819,7 +2897,7 @@ mod tests {
         one_lang_config(&fx);
         fx.write_page("content/_index.md", extra_fm(), "\n");
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get(), 1);
         let es = fm_of(&fx, "content/_index.es.md");
         assert_eq!(es["extra"]["hero"]["lede"].as_str(), Some("[es] Curriculo reads the work."));
@@ -2831,7 +2909,7 @@ mod tests {
         let fx = Fixture::new();
         fx.write_page("content/blog/_index.md", "title = \"Blog\"\n", "\n");
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get(), 0);
         assert!(!fx.root().join("content/blog/_index.es.md").exists());
     }
@@ -2842,8 +2920,8 @@ mod tests {
         one_lang_config(&fx);
         fx.write_page("content/home/index.md", extra_fm(), "Body Curriculo.\n");
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get(), 1, "unchanged page is fresh");
 
         fx.write_page(
@@ -2851,7 +2929,7 @@ mod tests {
             &extra_fm().replace("Start Free", "Start now"),
             "Body Curriculo.\n",
         );
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get(), 2, "an [extra] edit must regenerate the sibling");
     }
 
@@ -2877,7 +2955,7 @@ mod tests {
             "old body\n",
         );
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         let es = fm_of(&fx, "content/home/index.es.md");
         assert_eq!(es["extra"]["noindex"].as_bool(), Some(true));
         assert_ne!(es["extra"]["source_hash"].as_str(), Some("stale"));
@@ -2937,7 +3015,7 @@ mod tests {
             body,
         );
         let endpoint = TokenDroppingEndpoint { asked: Mutex::new(HashSet::new()) };
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &endpoint).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &endpoint).unwrap();
         let (_, written) = parse_page(&fx.root().join("content/post/index.es.md")).unwrap();
         assert_eq!(
             written.trim(),
@@ -3108,7 +3186,8 @@ mod tests {
     fn broken_markup_is_not_written() {
         let fx = Fixture::new();
         fx.write_page("content/post/index.md", en_page_fm(), "See <a href=\"/x\">Curriculo</a>.\n");
-        let res = translate_with(fx.root(), &fx.config(), None, false, "k", &TagDroppingClient);
+        let res =
+            translate_with(fx.root(), &fx.config(), None, false, None, "k", &TagDroppingClient);
         assert!(res.is_err());
         assert!(!fx.root().join("content/post/index.es.md").exists());
     }
@@ -3129,7 +3208,7 @@ mod tests {
             en_page_fm(),
             "Curriculo scores every candidate with written reasons.\n",
         );
-        let res = translate_with(fx.root(), &fx.config(), None, false, "k", &IdentityClient);
+        let res = translate_with(fx.root(), &fx.config(), None, false, None, "k", &IdentityClient);
         assert!(res.unwrap_err().to_string().contains("failure"));
         assert!(!fx.root().join("content/post/index.es.md").exists());
     }
@@ -3193,7 +3272,7 @@ mod tests {
         one_lang_config(&fx);
         fx.write_page("content/_index.md", extra_fm(), "\n");
         let mock = MockBatch::prefixing("ES ");
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let sent = mock.texts_of(0);
         assert!(sent.contains(&"Start Free".to_string()));
         assert!(sent.contains(&"Case studies".to_string()));
@@ -3223,7 +3302,7 @@ mod tests {
         assert!(es["extra"].get("source_hash").is_some());
 
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get(), 0, "an adopted sibling is fresh");
     }
 
@@ -3259,7 +3338,7 @@ mod tests {
         fx.write_page("content/a/index.md", en_page_fm(), body);
         fx.write_page("content/b/index.md", en_page_fm(), body);
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         // Break one sibling the way older translations did: `</a>` dropped.
         let broken = fx.root().join("content/a/index.es.md");
         let text = fs::read_to_string(&broken).unwrap().replace("</a>", "");
@@ -3272,7 +3351,7 @@ mod tests {
         assert!(recheck(fx.root(), &fx.config()).is_ok(), "nothing left to clear");
 
         let before = c.calls.get();
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
         assert_eq!(c.calls.get() - before, 1, "only the cleared sibling is redone");
     }
 
@@ -3316,7 +3395,7 @@ mod tests {
             "Body Curriculo.\n",
         );
         let c = EchoClient { calls: Cell::new(0) };
-        translate_with(fx.root(), &fx.config(), None, false, "k", &c).unwrap();
+        translate_with(fx.root(), &fx.config(), None, false, None, "k", &c).unwrap();
 
         let es = fm_of(&fx, "content/eng-post/index.es.md");
         assert_eq!(
@@ -3389,7 +3468,7 @@ mod tests {
         let en = page_source(&en_fm, &en_body);
         assert_eq!(en.extra, vec![("review_complaints_key".to_string(), "manatal".to_string())]);
         let mock = MockBatch::prefixing("ES ");
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let sent: Vec<String> = mock.calls().into_iter().flat_map(|(t, _)| t).collect();
         assert!(!sent.iter().any(|s| s.contains("connect") || s == "manatal"), "{sent:?}");
         let out = fx.page_body("content/manatal/index.es.md");
@@ -3491,7 +3570,7 @@ mod tests {
         );
         fx.write_page("content/docs/index.md", &fm, "Paste the snippet below.\n");
         let mock = MockBatch::prefixing("ES ");
-        translate_with_endpoint(fx.root(), &fx.config(), None, false, &mock).unwrap();
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, None, &mock).unwrap();
         let sent: Vec<String> = mock.calls().into_iter().flat_map(|(t, _)| t).collect();
         assert!(!sent.iter().any(|s| s.contains("curl")), "code went to the model: {sent:?}");
         let es = fm_of(&fx, "content/docs/index.es.md");
@@ -3502,5 +3581,89 @@ mod tests {
         // clear it again, forever).
         assert!(recheck(fx.root(), &fx.config()).is_ok(), "recheck cleared a pure-code value");
         assert!(fm_of(&fx, "content/docs/index.es.md")["extra"].get("source_hash").is_some());
+    }
+
+    #[test]
+    fn lang_name_known_codes_map_and_unknown_falls_back_to_code() {
+        // The 200-target gate: an unmapped code must not bail the OpenRouter
+        // path — it rides the prompt as the code itself.
+        assert_eq!(lang_name("es"), "Spanish");
+        assert_eq!(lang_name("zh"), "Chinese (Simplified)");
+        assert_eq!(lang_name("sw"), "sw");
+        assert_eq!(lang_name("xh-ZA"), "xh-ZA");
+    }
+
+    #[test]
+    fn resolve_langs_config_default_override_trim_dedupe_and_errors() {
+        let config = vec!["es".to_string(), "fr".to_string()];
+        // No override → config list verbatim.
+        assert_eq!(resolve_langs("en", &config, None).unwrap(), config);
+        // Override wins: trims, sorts, dedupes, drops the default language.
+        let over = vec![" de ".to_string(), "sw".to_string(), "de".to_string(), "en".to_string()];
+        assert_eq!(
+            resolve_langs("en", &config, Some(&over)).unwrap(),
+            vec!["de".to_string(), "sw".to_string()]
+        );
+        // All-blank / default-only overrides are errors, not silent fallbacks
+        // (clap's value_delimiter delivers blank segments for stray commas).
+        assert!(resolve_langs("en", &config, Some(&[" ".to_string(), "".to_string()])).is_err());
+        assert!(resolve_langs("en", &config, Some(&["en".to_string()])).is_err());
+    }
+
+    #[test]
+    fn is_default_page_scales_to_a_200_code_set() {
+        // Set-lookup semantics after the rsplit_once rewrite: any known code
+        // as the last dot-segment excludes the page; unknown suffixes and
+        // plain names stay default pages.
+        let codes: Vec<String> = (b'a'..=b'z')
+            .flat_map(|a| (b'a'..=b'j').map(move |b| format!("{}{}", a as char, b as char)))
+            .collect();
+        assert!(codes.len() >= 200, "fixture must exercise a 200+ code set");
+        let set: HashSet<&str> = codes.iter().map(String::as_str).collect();
+        assert!(is_default_page("index.md", &set));
+        assert!(is_default_page("index.v2.md", &set), "unknown suffix ⇒ default page");
+        assert!(is_default_page("_index.md", &set), "section landing pages are sources");
+        assert!(!is_default_page("index.aj.md", &set), "code in set ⇒ translation page");
+        assert!(is_default_page("index.zz.md", &set), "code outside set ⇒ default page");
+    }
+
+    #[test]
+    fn langs_override_drains_only_listed_langs_and_skips_config_siblings() {
+        // --langs de on an es+fr config: only de is drained, and the existing
+        // `index.es.md` sibling is NOT itself treated as a default page (no
+        // `index.es.de.md`).
+        let fx = Fixture::new(); // config: es + fr
+        fx.write_page("content/post/index.md", en_page_fm(), "Body one.\n");
+        fx.write_page("content/post/index.es.md", en_page_fm(), "Cuerpo uno.\n");
+        let mock = MockBatch::new();
+        let over = vec!["de".to_string()];
+        translate_with_endpoint(fx.root(), &fx.config(), None, false, Some(&over), &mock).unwrap();
+        assert_eq!(mock.langs(), vec!["de"], "override must replace, not extend, config langs");
+        assert!(fx.root().join("content/post/index.de.md").exists(), "de sibling written");
+        assert!(
+            !fx.root().join("content/post/index.es.de.md").exists(),
+            "es sibling must not become a source page"
+        );
+        assert!(!fx.root().join("content/post/index.fr.md").exists(), "fr not in override");
+    }
+
+    #[test]
+    fn langs_override_openrouter_path_drains_only_listed_langs() {
+        // Same --langs semantics through the OpenRouter driver
+        // (`translate_with`): the override replaces the config list, and the
+        // pre-existing es sibling stays excluded from the source set.
+        let fx = Fixture::new(); // config: es + fr
+        fx.write_page("content/post/index.md", en_page_fm(), "Body one.\n");
+        fx.write_page("content/post/index.es.md", en_page_fm(), "Cuerpo uno.\n");
+        let c = EchoClient { calls: Cell::new(0) };
+        let over = vec!["de".to_string()];
+        translate_with(fx.root(), &fx.config(), None, false, Some(&over), "test-key", &c).unwrap();
+        assert_eq!(c.calls.get(), 1, "only de — override must replace, not extend, config langs");
+        assert!(fx.root().join("content/post/index.de.md").exists(), "de sibling written");
+        assert!(
+            !fx.root().join("content/post/index.es.de.md").exists(),
+            "es sibling must not become a source page"
+        );
+        assert!(!fx.root().join("content/post/index.fr.md").exists(), "fr not in override");
     }
 }

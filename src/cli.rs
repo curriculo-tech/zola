@@ -150,6 +150,11 @@ pub enum Command {
         /// output checks, so the next run redoes them (no API, no key)
         #[clap(long, conflicts_with_all = ["max", "dry_run"])]
         recheck: bool,
+        /// Override target languages (comma-separated codes, e.g. `es,sw,tl`),
+        /// ignoring [languages] in config.toml — any code the translation
+        /// backend accepts is fair game. config.toml stays the default.
+        #[clap(long, value_delimiter = ',', conflicts_with_all = ["adopt", "recheck"])]
+        langs: Option<Vec<String>>,
     },
 
     /// Build/refresh the topical knowledge graph (migrate once via Firecrawl,

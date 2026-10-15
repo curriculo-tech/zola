@@ -206,7 +206,7 @@ fn main() {
             let cmd = &mut Cli::command();
             clap_complete::generate(shell, cmd, cmd.get_name().to_string(), &mut std::io::stdout());
         }
-        Command::Translate { max, dry_run, adopt, recheck } => {
+        Command::Translate { max, dry_run, adopt, recheck, langs } => {
             log::info!("Translating...");
             let (root_dir, config_file) = get_config_file_path(&cli_dir, cli.config.as_deref());
             let res = if adopt {
@@ -214,7 +214,7 @@ fn main() {
             } else if recheck {
                 cmd::translate_recheck(&root_dir, &config_file)
             } else {
-                cmd::translate(&root_dir, &config_file, max, dry_run)
+                cmd::translate(&root_dir, &config_file, max, dry_run, langs)
             };
             if let Err(e) = res {
                 messages::unravel_errors("Failed to translate", &e);

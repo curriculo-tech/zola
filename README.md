@@ -16,7 +16,7 @@ content is committed markdown under the site root, no CMS).
 
 | Command | What it does | Network |
 |---|---|---|
-| `zola translate [--max N] [--dry-run]` | Generate/refresh co-located `index.<lang>.md` siblings via OpenRouter, hash-gated on `extra.source_hash`. | OpenRouter |
+| `zola translate [--max N] [--dry-run] [--langs a,b,…]` | Generate/refresh co-located `index.<lang>.md` siblings via OpenRouter, hash-gated on `extra.source_hash`. `--langs` overrides `[languages]` from config.toml. | OpenRouter |
 | `zola graph migrate --from <url> [--max N] [--force] [--dry-run]` | **Once per origin.** Firecrawl-crawl a live site into markdown + a topical KG under `data/graph/`. Guarded by `meta.source_origin`. | Firecrawl + OpenRouter |
 | `zola graph refresh [--max N] [--dry-run]` | **Forever after.** Re-topic stale local markdown into `data/graph/`. Never crawls. | OpenRouter |
 
