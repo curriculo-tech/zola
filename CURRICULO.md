@@ -68,7 +68,8 @@ zola --root <site> translate --adopt      # stamp good hand translations fresh, 
   Text kept as written this way is logged (`kept as written (reads as a name)`).
   On OpenRouter, a batch the model answers in the wrong shape is retried one text
   at a time; HTTP, auth and timeout errors fail the batch at once.
-- **Never written:** output that loses a brand token, changes the HTML tags, any
+- **Never written:** output that loses a brand token (the built-in Curriculo
+  tokens or any `TRANSLATE_PRESERVE_TERMS` term, on every engine), changes the HTML tags, any
   tag attribute other than the reader-facing ones above (a translated `class`
   drops the CSS), inline code or `<code>` content, or leaves a masking
   placeholder (`⟦0⟧`, `XHTML0003X`) behind; adds a bare `<` (the cause of

@@ -203,9 +203,9 @@ pub trait BatchTranslateClient {
 /// Sourced from `TRANSLATE_PRESERVE_TERMS` (comma-separated) via
 /// [`preserve_terms_from_env`], and only included in the body when non-empty.
 ///
-/// Note the endpoint ignores terms shorter than 3 characters, and the INV-5
-/// [`glossary_ok`] gate still checks only the built-in [`GLOSSARY`] — caller
-/// terms are trusted to the endpoint's mask/restore machinery.
+/// Note the endpoint ignores terms shorter than 3 characters. The INV-5
+/// [`glossary_ok`] gate checks the built-in [`GLOSSARY`] and these caller
+/// terms on every engine, so a term the engine still drops is never written.
 ///
 /// Failure envelopes are hard failures, never passthroughs: the endpoint may
 /// answer HTTP 200 with a scalar `"ok": false` or a mirrored error code
@@ -438,7 +438,7 @@ fn openrouter_translate_texts(
         Tokens such as XHTML0003X stand for markup: copy each one exactly, once, in the same relative \
         order, and do not translate, remove, add or renumber them. \
         Preserve these brand tokens verbatim, untranslated: {}. No prose outside the JSON.",
-        GLOSSARY.join(", ")
+        brand_terms(&preserve_terms_from_env()).join(", ")
     );
     let payload = json!({
         "model": MODEL,
@@ -684,7 +684,20 @@ fn all_texts(t: &Translatable) -> impl Iterator<Item = &str> {
 
 /// INV-5 post-check: every glossary token in the source must appear verbatim in
 /// the translation. Failure ⇒ the caller must NOT write the file.
+///
+/// Covers the built-in [`GLOSSARY`] and the caller's `TRANSLATE_PRESERVE_TERMS`
+/// (see [`preserve_terms_from_env`]), on every engine: the endpoint masks those
+/// terms, but OpenRouter only gets them as a prompt instruction, so this gate
+/// is what keeps a "Greenhouse" that came back as "Serre" from being written.
 pub fn glossary_ok(en: &Translatable, t: &Translatable) -> Result<()> {
+    glossary_ok_with(en, t, &preserve_terms_from_env())
+}
+
+/// [`glossary_ok`] with the caller terms passed in (pure, for tests).
+/// Built-in tokens keep their substring match; caller terms match on word
+/// boundaries, so "Lever" in "Leverage" or "Odoo" inside a longer word does
+/// not count, and terms under 3 characters are ignored like the endpoint does.
+pub fn glossary_ok_with(en: &Translatable, t: &Translatable, extra: &[String]) -> Result<()> {
     let en_blob = all_texts(en).collect::<Vec<_>>().join(" ");
     let t_blob = all_texts(t).collect::<Vec<_>>().join(" ");
     for token in GLOSSARY {
@@ -692,7 +705,53 @@ pub fn glossary_ok(en: &Translatable, t: &Translatable) -> Result<()> {
             bail!("glossary: brand token {token:?} lost in translation");
         }
     }
+    for term in caller_terms(extra) {
+        if contains_term(&en_blob, term) && !contains_term(&t_blob, term) {
+            bail!("glossary: brand token {term:?} lost in translation");
+        }
+    }
     Ok(())
+}
+
+/// Caller terms the gate and the OpenRouter prompt add to [`GLOSSARY`]:
+/// at least 3 characters, not already built in, first occurrence kept.
+fn caller_terms(extra: &[String]) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for term in extra.iter().map(|t| t.trim()) {
+        if term.chars().count() >= 3 && !GLOSSARY.contains(&term) && !out.contains(&term) {
+            out.push(term);
+        }
+    }
+    out
+}
+
+/// Built-in [`GLOSSARY`] followed by the caller terms, for the OpenRouter prompt.
+fn brand_terms(extra: &[String]) -> Vec<String> {
+    GLOSSARY
+        .iter()
+        .map(|t| t.to_string())
+        .chain(caller_terms(extra).into_iter().map(str::to_string))
+        .collect()
+}
+
+/// `term` occurs in `hay` with no letter or digit directly before or after it.
+fn contains_term(hay: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric();
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(term) {
+        let start = from + pos;
+        let end = start + term.len();
+        let before_ok = hay[..start].chars().next_back().map_or(true, |c| !is_word(c));
+        let after_ok = hay[end..].chars().next().map_or(true, |c| !is_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Post-check: the translation carries the same HTML tags as the source, and no
@@ -2837,6 +2896,48 @@ mod tests {
         let lost = Translatable { title: "Bienvenue sur Brand".into(), ..en.clone() };
         assert!(glossary_ok(&en, &ok).is_ok());
         assert!(glossary_ok(&en, &lost).is_err());
+    }
+
+    #[test]
+    fn glossary_gates_caller_terms_on_word_boundaries() {
+        let terms = vec![
+            "Greenhouse".to_string(),
+            "Lever".to_string(),
+            "MCP".to_string(),
+            "HR".to_string(),
+        ];
+        let en = t("Greenhouse pricing", "", "Compare Lever and Greenhouse over MCP.");
+        let kept = t("Prix de Greenhouse", "", "Comparez Lever et Greenhouse via MCP.");
+        let serre = t("Prix de la serre", "", "Comparez Lever et la serre via MCP.");
+        assert!(glossary_ok_with(&en, &kept, &terms).is_ok());
+        let err = glossary_ok_with(&en, &serre, &terms).unwrap_err().to_string();
+        assert!(err.contains("Greenhouse"), "{err}");
+        // A caller term inside a longer word is not a brand use.
+        let en2 = t("Leverage your HR team", "", "");
+        let t2 = t("Tirez parti de votre equipe RH", "", "");
+        assert!(
+            glossary_ok_with(&en2, &t2, &terms).is_ok(),
+            "Leverage is not Lever, HR is under 3 chars"
+        );
+        // No caller terms: built-in behaviour only.
+        assert!(glossary_ok_with(&en, &serre, &[]).is_ok());
+    }
+
+    #[test]
+    fn brand_terms_merge_builtin_and_caller_terms_once() {
+        let terms = vec![
+            " Greenhouse ".to_string(),
+            "Curriculo".to_string(),
+            "Greenhouse".to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(
+            brand_terms(&terms),
+            vec!["Curriculo", "Curriculo ATS", "CurriculoATS", "Greenhouse"]
+        );
+        assert!(contains_term("vs Greenhouse.", "Greenhouse"));
+        assert!(!contains_term("Greenhouses", "Greenhouse"));
+        assert!(contains_term("é Greenhouse é", "Greenhouse"));
     }
 
     // ── [extra] copy, sections, output checks ──────────────────────────
